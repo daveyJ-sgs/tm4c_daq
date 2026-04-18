@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//C/ti/ccs2050/ccs/theia/resources/ai/**)"
+    ],
+    "ask": []
+  },
+  "env": {
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"
+  }
+}

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pdf
+
+.theia/
+usb_dev_serial/Debug/
+usb_dev_serial/project.log
+test_results_*/
+
+Archive/save/
+*.theia-workspace
