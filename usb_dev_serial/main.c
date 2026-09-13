@@ -771,11 +771,13 @@ main(void)
                     ui32Tail = (ui32Tail + 1) & ADC_BUFFER_MASK;
                     uint16_t sB = g_pui16ADCBuffer[ui32Tail];
                     ui32Tail = (ui32Tail + 1) & ADC_BUFFER_MASK;
-                    // 0xFF is reserved for command triplets; clamp sA[11:4] to 0xFE.
-                    // This clips sA values 4080-4095 to 4079 (signals above 3.287 V).
-                    uint8_t ui8B0 = (uint8_t)(sA >> 4);
-                    if(ui8B0 == 0xFF) { ui8B0 = 0xFE; }
-                    g_pui8USBBatch[ui32Bytes++] = ui8B0;
+                    // 0xFF is reserved for command triplets, so sA[11:4] must
+                    // never reach 0xFF.  Clamp the whole sample rather than just
+                    // its high byte: clamping the byte alone folds codes
+                    // 4080-4095 back down by 16 counts (non-monotonic).  This
+                    // saturates them at 4079 (3.287 V) instead.
+                    if(sA > 4079) { sA = 4079; }
+                    g_pui8USBBatch[ui32Bytes++] = (uint8_t)(sA >> 4);
                     g_pui8USBBatch[ui32Bytes++] = (uint8_t)((sA << 4) | (sB >> 8));
                     g_pui8USBBatch[ui32Bytes++] = (uint8_t)(sB);
                 }
