@@ -64,6 +64,10 @@ dropping usblib's 8 KB TX buffer freed the rest.
   serial drain. Both readers share its `ProtocolDecoder`, so the protocol
   exists in exactly one place
 - `usb_test.py` — raw byte dump for diagnosing the port
+- `docs/` — design and reference notes that are longer than a comment:
+  `double-packet-buffering-scope.md` (roadmap item 4, scoped against the real
+  TivaWare source) and `oversampling-and-adc-characterisation.md` (what link
+  bandwidth is worth, and how to measure this ADC with what is on the bench)
 
 ## Wire protocol
 
@@ -271,8 +275,12 @@ the next one.
 2. ~~Burst capture~~ — done
 3. ~~Trigger system~~ — done (edge, pre-trigger, auto/normal/single)
 4. **Double-packet buffering**, now that the device is actually serialised on
-   one packet in flight rather than CPU-bound. Needs `usbdcdc.c` built from
-   source so its binary busy flag becomes a count of packets outstanding.
+   one packet in flight rather than CPU-bound. Scoped in
+   `docs/double-packet-buffering-scope.md` — read it first. Headlines: the
+   controller supports DPB but **driverlib does not expose it** (no `_DB` FIFO
+   size flags), so it takes direct register writes; forking `usbdcdc.c` is one
+   of two paths, not the only one; and there is a zero-length-packet check
+   worth ten minutes before any of it.
    This is now the *only* thing between us and higher streaming rates: with
    the host reader in its own process the host is not a limit anywhere. At the
    400 kS/s preset the device delivers ~349,000 S/s and reports ~50,400
