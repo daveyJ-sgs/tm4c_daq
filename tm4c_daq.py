@@ -20,6 +20,26 @@ Command packets (3 bytes, triplet-aligned):
     [0xFF] [0x60 | rate_index] [0x00]   ADC sample-rate changed
     [0xFF] [0x80 | oflow_hi]   [oflow_lo]  Firmware overflow delta
     [0xFF] [0xA0 | recoveries]  [0x00]      Acquisition stall recovered
+    [0xFF] [0xC0 | sub]         [data]      Burst capture / trigger telemetry
+
+Burst frames (code 0xC0) arrive as a header run followed by a contiguous,
+uninterrupted payload:
+
+    0xC0 state, 0xC1 len_hi, 0xC2 len_lo, 0xC3 trig_hi, 0xC4 trig_lo,
+    0xC5 rate_idx, 0xC6 flags, 0xC8 lvl_hi, 0xC9 lvl_lo, 0xC7 BEGIN,
+    then exactly len/2 data triplets.
+
+BEGIN is always the LAST header triplet — the subcodes are not in ascending
+order, so never treat "sub >= BEGIN" as "not a header".
+
+The payload is ORDER-SENSITIVE, so unlike the streaming path it cannot be
+recovered with a boolean mask — the reader slices from the row after BEGIN and
+carries an accumulator across reads until len samples have been collected.
+
+Note: only b0 must avoid 0xFF, so sA (even-index samples) clamps at 4079 while
+sB (odd-index) reaches 4095.  A rail-to-rail square wave therefore shows a
+16-count sawtooth on alternate samples at the top rail.  That is by design —
+nothing here may assume the two halves of a triplet are symmetric.
 
 Note: the stream carries no sync marker, so a lost or duplicated byte would
 misalign every triplet after it and decode as garbage forever.  Data triplets
@@ -41,6 +61,7 @@ import pyqtgraph as pg
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QGroupBox, QGridLayout, QScrollArea,
+    QDoubleSpinBox,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QFont, QColor
@@ -86,6 +107,80 @@ STYLE_INACTIVE = "background:#333; color:#666; border-radius:3px; padding:2px;"
 STYLE_FREQ_ACTIVE   = ("background:#44aaff; color:#000; border-radius:3px; "
                         "padding:2px; font-weight:bold;")
 STYLE_FREQ_INACTIVE = "background:#333; color:#666; border-radius:3px; padding:2px;"
+
+# ---- Burst capture / trigger (protocol v1) ----
+# Host -> device is [0xFE][0xC0|sub][argHi][argLo]; device -> host is the
+# ordinary status triplet [0xFF][0xC0|sub][data].
+BURST_CMD           = 0xC0      # command/status code nibble-pair for burst
+BURST_SUB_ACTION    = 0x0
+BURST_SUB_LEVEL     = 0x1
+BURST_SUB_SLOPE     = 0x2
+BURST_SUB_PRE_PCT   = 0x3
+BURST_SUB_LENGTH    = 0x4
+BURST_SUB_AUTO_MS   = 0x5
+
+BURST_ACTION_DISARM     = 0     # return to STREAM
+BURST_ACTION_ARM_SINGLE = 1
+BURST_ACTION_ARM_CONT   = 2     # device auto-rearms after each drain
+BURST_ACTION_FORCE      = 3
+
+# Device -> host status subcodes.  0x0 is the state enum; every other subcode
+# except BEGIN is a frame header field.  BEGIN is emitted LAST regardless of its
+# number, so "is a header" is `sub != BEGIN`, never `sub < BEGIN`.
+BURST_ST_STATE   = 0x0
+BURST_ST_LEN_HI  = 0x1
+BURST_ST_LEN_LO  = 0x2
+BURST_ST_TRIG_HI = 0x3
+BURST_ST_TRIG_LO = 0x4
+BURST_ST_RATE    = 0x5
+BURST_ST_FLAGS   = 0x6
+BURST_ST_BEGIN   = 0x7
+BURST_ST_LVL_HI  = 0x8          # v2: the level this capture actually used
+BURST_ST_LVL_LO  = 0x9
+
+BURST_STATE_STREAM    = 0
+BURST_STATE_IDLE      = 1
+BURST_STATE_ARMED     = 2
+BURST_STATE_TRIGGERED = 3
+BURST_STATE_FULL      = 4
+BURST_STATE_DRAINING  = 5
+
+BURST_STATE_NAMES = {
+    BURST_STATE_STREAM:    "Stream",
+    BURST_STATE_IDLE:      "Idle",
+    BURST_STATE_ARMED:     "Armed",
+    BURST_STATE_TRIGGERED: "Triggered",
+    BURST_STATE_FULL:      "Full",
+    BURST_STATE_DRAINING:  "Draining",
+}
+
+def _burst_state_style(bg, fg="#000"):
+    return (f"background:{bg}; color:{fg}; border-radius:3px; padding:3px; "
+            f"font-weight:bold;")
+
+BURST_STATE_STYLES = {
+    BURST_STATE_STREAM:    _burst_state_style("#333", "#888"),
+    BURST_STATE_IDLE:      _burst_state_style("#555", "#ccc"),
+    BURST_STATE_ARMED:     _burst_state_style("#ffaa00"),
+    BURST_STATE_TRIGGERED: _burst_state_style("#00ff88"),
+    BURST_STATE_FULL:      _burst_state_style("#44aaff"),
+    BURST_STATE_DRAINING:  _burst_state_style("#aa66ff"),
+}
+
+# (label, action, auto_ms) — Single arms once, Normal re-arms with no timeout,
+# Auto re-arms and lets the device self-trigger when no edge shows up.
+BURST_AUTO_MS  = 200
+BURST_MODES = [
+    ("Single", BURST_ACTION_ARM_SINGLE, 0),
+    ("Normal", BURST_ACTION_ARM_CONT,   0),
+    ("Auto",   BURST_ACTION_ARM_CONT,   BURST_AUTO_MS),
+]
+BURST_LENGTHS      = [1024, 2048, 4096, 8192]
+BURST_LENGTH_MIN   = 64         # device clamps to 64..8192 and forces even
+BURST_LENGTH_MAX   = 8192
+BURST_PRE_PERCENTS = [0, 25, 50, 75]
+BURST_SLOPES       = [("Rising", 0), ("Falling", 1)]
+BURST_DEFAULT_LEVEL_V = VCC / 2
 
 
 # ---------------------------------------------
@@ -155,6 +250,8 @@ class SerialReader(QObject):
     stall_recovered = Signal(int)   # Firmware recovered a stalled DMA pipeline
     resynced       = Signal(int)    # Reader re-derived triplet alignment
     status_changed = Signal(str)    # Status string for UI
+    burst_state    = Signal(int)    # Burst state enum 0-5
+    burst_frame    = Signal(object)  # dict: samples/trig/rate_idx/slope/forced
 
     def __init__(self, port, baud=115200):
         super().__init__()
@@ -167,6 +264,14 @@ class SerialReader(QObject):
         self._samples_lock = threading.Lock()
         self._sample_chunks = collections.deque()
         self._resync_count = 0
+
+        # Burst frame assembly.  The header subcodes land in _burst_hdr as they
+        # arrive; BEGIN switches the decoder into collecting mode, where whole
+        # triplet rows are appended to _burst_accum until _burst_needed samples
+        # have been gathered.  Payload samples never reach the streaming queue.
+        self._burst_hdr    = {}
+        self._burst_accum  = []
+        self._burst_needed = 0
 
     def start(self):
         self._stop.clear()
@@ -189,9 +294,157 @@ class SerialReader(QObject):
             self._sample_chunks.clear()
             return chunks
 
+    def send_burst(self, sub, arg):
+        """Queue a 4-byte burst command [0xFE][0xC0|sub][argHi][argLo]."""
+        self.send(bytes([0xFE, BURST_CMD | (sub & 0x0F),
+                         (arg >> 8) & 0xFF, arg & 0xFF]))
+
     def _queue_samples(self, samples):
         with self._samples_lock:
             self._sample_chunks.append(samples)
+
+    # -- Burst frame assembly ----------------------
+    @staticmethod
+    def _decode_triplets(t):
+        """Vectorized triplet → sample decode.  t is an N×3 uint8 array."""
+        b0 = t[:, 0].astype(np.uint16)
+        b1 = t[:, 1].astype(np.uint16)
+        b2 = t[:, 2].astype(np.uint16)
+        samples = np.empty(len(t) * 2, dtype=np.uint16)
+        samples[0::2] = (b0 << 4) | (b1 >> 4)
+        samples[1::2] = ((b1 & 0x0F) << 8) | b2
+        return samples
+
+    def _begin_burst(self):
+        """BEGIN seen — snapshot the header and switch into collecting mode."""
+        length = ((self._burst_hdr.get(BURST_ST_LEN_HI, 0) << 8)
+                  | self._burst_hdr.get(BURST_ST_LEN_LO, 0))
+        if (length < BURST_LENGTH_MIN or length > BURST_LENGTH_MAX
+                or length % 2):
+            # Header lost or corrupt — drop the frame rather than swallow an
+            # arbitrary slice of the stream as payload.
+            self._burst_hdr = {}
+            return False
+        self._burst_needed = length
+        self._burst_accum = []
+        return True
+
+    def _finish_burst(self):
+        """Payload complete — decode it and hand the frame to the GUI."""
+        hdr = self._burst_hdr
+        length = (hdr.get(BURST_ST_LEN_HI, 0) << 8) | hdr.get(BURST_ST_LEN_LO, 0)
+        trig = (hdr.get(BURST_ST_TRIG_HI, 0) << 8) | hdr.get(BURST_ST_TRIG_LO, 0)
+        flags = hdr.get(BURST_ST_FLAGS, 0)
+
+        # The level the capture actually fired against (v2).  Absent from a v1
+        # device — report None rather than 0 so the GUI falls back to its own
+        # pending value instead of drawing the threshold down at 0 V.
+        if BURST_ST_LVL_HI in hdr or BURST_ST_LVL_LO in hdr:
+            level = ((hdr.get(BURST_ST_LVL_HI, 0) << 8)
+                     | hdr.get(BURST_ST_LVL_LO, 0))
+        else:
+            level = None
+
+        if self._burst_accum:
+            t = (self._burst_accum[0] if len(self._burst_accum) == 1
+                 else np.concatenate(self._burst_accum))
+            samples = self._decode_triplets(t)[:length]
+        else:
+            samples = np.array([], dtype=np.uint16)
+
+        self._burst_hdr    = {}
+        self._burst_accum  = []
+        self._burst_needed = 0
+
+        self.burst_frame.emit({
+            "samples":  samples,
+            "trig":     min(trig, max(len(samples) - 1, 0)),
+            "rate_idx": hdr.get(BURST_ST_RATE, 0),
+            "slope":    flags & 0x01,
+            "forced":   bool(flags & 0x02),
+            "level":    level,
+        })
+
+    def _process_triplets(self, t):
+        """Split a read into burst payload runs and ordinary stream triplets.
+
+        Burst payload is order-sensitive: it is the contiguous run immediately
+        after BEGIN.  Everything outside that run goes through the usual
+        mask-based streaming decode, which does not care about ordering.
+        """
+        while len(t):
+            if self._burst_needed > 0:
+                want = (self._burst_needed + 1) // 2      # len is always even
+                take = min(want, len(t))
+                self._burst_accum.append(t[:take])
+                self._burst_needed -= take * 2
+                t = t[take:]
+                if self._burst_needed <= 0:
+                    self._finish_burst()
+                continue
+
+            # Not collecting — look for the next BEGIN triplet.
+            begins = np.flatnonzero((t[:, 0] == 0xFF)
+                                    & (t[:, 1] == (BURST_CMD | BURST_ST_BEGIN)))
+            if not begins.size:
+                self._process_stream(t)
+                return
+
+            idx = int(begins[0])
+            self._process_stream(t[:idx])       # header subcodes live in here
+            t = t[idx + 1:]                     # BEGIN itself is consumed
+            self._begin_burst()
+
+    def _process_stream(self, t):
+        """The original streaming decode: order-independent, fully vectorized."""
+        if not len(t):
+            return
+
+        b0 = t[:, 0]
+        b1 = t[:, 1].astype(np.uint16)
+        b2 = t[:, 2].astype(np.uint16)
+
+        is_cmd  = (b0 == 0xFF)
+        is_data = ~is_cmd
+
+        # Command triplets — iterate (rare, at most a few per button press)
+        if is_cmd.any():
+            for cmd_b0, cmd_b1, cmd_b2 in t[is_cmd]:
+                cmd = int(cmd_b1)
+                code = cmd & 0xF0
+                arg = cmd & 0x0F
+                if code == 0x40:
+                    self.duty_changed.emit(arg)
+                elif code == 0x20:
+                    self.freq_changed.emit(arg)
+                elif code == 0x60:
+                    self.sample_rate_changed.emit(arg)
+                elif code == 0x80:
+                    delta = (arg << 8) | int(cmd_b2)
+                    self.overflow_delta.emit(delta)
+                elif code == 0xA0:
+                    self.stall_recovered.emit(arg)
+                elif code == BURST_CMD:
+                    data = int(cmd_b2)
+                    if arg == BURST_ST_STATE:
+                        self.burst_state.emit(data)
+                    elif arg != BURST_ST_BEGIN:
+                        # Frame header.  BEGIN is emitted last but is not the
+                        # highest subcode, so this must not be a `<` test.
+                        self._burst_hdr[arg] = data
+                    # BEGIN never reaches here; _process_triplets consumes it.
+
+        # Data triplets — fully vectorized, no Python loop
+        if is_data.any():
+            db0 = b0[is_data].astype(np.uint16)
+            db1 = b1[is_data]
+            db2 = b2[is_data]
+            sA = (db0 << 4) | (db1 >> 4)
+            sB = ((db1 & 0x0F) << 8) | db2
+            samples = np.empty(len(sA) * 2, dtype=np.uint16)
+            samples[0::2] = sA
+            samples[1::2] = sB
+            self._queue_samples(samples)
 
     def _run(self):
         try:
@@ -238,7 +491,10 @@ class SerialReader(QObject):
                 # from here on with nothing to signal it.  Data triplets never
                 # start with 0xFF; if the b0 slot says otherwise, re-derive the
                 # offset from the slot that does satisfy the invariant.
-                if len(buf) >= ALIGN_MIN_BYTES:
+                # Suppressed mid-frame: a burst payload is pure data, so the
+                # b0 invariant cannot fire legitimately there, and a false
+                # positive would shear the frame in half.
+                if len(buf) >= ALIGN_MIN_BYTES and self._burst_needed <= 0:
                     rates = [float((buf[o::3] == 0xFF).mean()) for o in range(3)]
                     best = min(range(3), key=lambda o: rates[o])
                     if best != 0 and rates[0] > ALIGN_TOLERANCE                             and rates[best] < rates[0] / 4:
@@ -253,43 +509,8 @@ class SerialReader(QObject):
                     continue
 
                 # Reshape to column vectors: each row is one triplet [b0, b1, b2]
-                t = buf[:n_triplets * 3].reshape(n_triplets, 3)
-                b0 = t[:, 0]
-                b1 = t[:, 1].astype(np.uint16)
-                b2 = t[:, 2].astype(np.uint16)
-
-                is_cmd  = (b0 == 0xFF)
-                is_data = ~is_cmd
-
-                # Command triplets — iterate (rare, at most a few per button press)
-                if is_cmd.any():
-                    for cmd_b0, cmd_b1, cmd_b2 in t[is_cmd]:
-                        cmd = int(cmd_b1)
-                        code = cmd & 0xF0
-                        arg = cmd & 0x0F
-                        if code == 0x40:
-                            self.duty_changed.emit(arg)
-                        elif code == 0x20:
-                            self.freq_changed.emit(arg)
-                        elif code == 0x60:
-                            self.sample_rate_changed.emit(arg)
-                        elif code == 0x80:
-                            delta = (arg << 8) | int(cmd_b2)
-                            self.overflow_delta.emit(delta)
-                        elif code == 0xA0:
-                            self.stall_recovered.emit(arg)
-
-                # Data triplets — fully vectorized, no Python loop
-                if is_data.any():
-                    db0 = b0[is_data].astype(np.uint16)
-                    db1 = b1[is_data]
-                    db2 = b2[is_data]
-                    sA = (db0 << 4) | (db1 >> 4)
-                    sB = ((db1 & 0x0F) << 8) | db2
-                    samples = np.empty(len(sA) * 2, dtype=np.uint16)
-                    samples[0::2] = sA
-                    samples[1::2] = sB
-                    self._queue_samples(samples)
+                self._process_triplets(
+                    buf[:n_triplets * 3].reshape(n_triplets, 3))
         finally:
             self._ser = None
             ser.close()
@@ -318,6 +539,19 @@ class DAQWindow(QMainWindow):
         self._start_time   = 0.0
         self._stats        = {}
         self._test_harness = None
+
+        # Burst / trigger.  _frame_mode gates the live plot: while a burst is
+        # engaged the frozen frame owns the curve and the streaming timer must
+        # not overwrite it.
+        self._burst_state   = BURST_STATE_STREAM
+        self._burst_engaged = False
+        self._frame_mode    = False
+        self._frame_count   = 0
+        self._burst_level_counts = int(round(
+            BURST_DEFAULT_LEVEL_V / VCC * ADC_MAX))
+        # Level echoed by the frame on screen, or None while no frame has been
+        # drawn for this engagement (then the pending spin-box value is shown).
+        self._frame_level_counts = None
 
         self._build_ui()
         self._build_plot()
@@ -503,6 +737,79 @@ class DAQWindow(QMainWindow):
 
         right.addWidget(grp_duty)
 
+        # Burst capture / trigger
+        grp_burst = QGroupBox("Burst / Trigger")
+        bu_layout = QGridLayout(grp_burst)
+
+        self.lbl_burst_state = QLabel(BURST_STATE_NAMES[BURST_STATE_STREAM])
+        self.lbl_burst_state.setAlignment(Qt.AlignCenter)
+        self.lbl_burst_state.setFixedHeight(26)
+        self.lbl_burst_state.setStyleSheet(
+            BURST_STATE_STYLES[BURST_STATE_STREAM])
+        bu_layout.addWidget(self.lbl_burst_state, 0, 0, 1, 2)
+
+        self.btn_burst_arm = QPushButton("Arm")
+        self.btn_burst_arm.clicked.connect(self._on_burst_arm_clicked)
+        bu_layout.addWidget(self.btn_burst_arm, 1, 0)
+
+        self.btn_burst_force = QPushButton("Force")
+        self.btn_burst_force.setToolTip(
+            "Trigger the current capture immediately, edge or no edge")
+        self.btn_burst_force.clicked.connect(self._on_burst_force_clicked)
+        self.btn_burst_force.setEnabled(False)
+        bu_layout.addWidget(self.btn_burst_force, 1, 1)
+
+        bu_layout.addWidget(QLabel("Mode:"), 2, 0)
+        self.cb_burst_mode = QComboBox()
+        for i, (label, _action, _auto) in enumerate(BURST_MODES):
+            self.cb_burst_mode.addItem(label, i)
+        self.cb_burst_mode.setCurrentIndex(0)
+        self.cb_burst_mode.setToolTip(
+            "Single: one capture.  Normal: re-arm after each frame.  "
+            "Auto: re-arm and self-trigger if no edge arrives.")
+        self.cb_burst_mode.currentIndexChanged.connect(self._on_burst_mode_changed)
+        bu_layout.addWidget(self.cb_burst_mode, 2, 1)
+
+        bu_layout.addWidget(QLabel("Level:"), 3, 0)
+        self.spin_burst_level = QDoubleSpinBox()
+        self.spin_burst_level.setRange(0.0, VCC)
+        self.spin_burst_level.setDecimals(3)
+        self.spin_burst_level.setSingleStep(0.05)
+        self.spin_burst_level.setSuffix(" V")
+        self.spin_burst_level.setValue(BURST_DEFAULT_LEVEL_V)
+        self.spin_burst_level.valueChanged.connect(self._on_burst_level_changed)
+        bu_layout.addWidget(self.spin_burst_level, 3, 1)
+
+        bu_layout.addWidget(QLabel("Slope:"), 4, 0)
+        self.cb_burst_slope = QComboBox()
+        for label, value in BURST_SLOPES:
+            self.cb_burst_slope.addItem(label, value)
+        self.cb_burst_slope.currentIndexChanged.connect(self._on_burst_slope_changed)
+        bu_layout.addWidget(self.cb_burst_slope, 4, 1)
+
+        bu_layout.addWidget(QLabel("Pre-trig:"), 5, 0)
+        self.cb_burst_pre = QComboBox()
+        for pct in BURST_PRE_PERCENTS:
+            self.cb_burst_pre.addItem(f"{pct}%", pct)
+        self.cb_burst_pre.setCurrentIndex(BURST_PRE_PERCENTS.index(50))
+        self.cb_burst_pre.currentIndexChanged.connect(self._on_burst_pre_changed)
+        bu_layout.addWidget(self.cb_burst_pre, 5, 1)
+
+        bu_layout.addWidget(QLabel("Length:"), 6, 0)
+        self.cb_burst_length = QComboBox()
+        for n in BURST_LENGTHS:
+            self.cb_burst_length.addItem(f"{n}", n)
+        self.cb_burst_length.setCurrentIndex(len(BURST_LENGTHS) - 1)
+        self.cb_burst_length.currentIndexChanged.connect(
+            self._on_burst_length_changed)
+        bu_layout.addWidget(self.cb_burst_length, 6, 1)
+
+        bu_layout.addWidget(QLabel("Frames:"), 7, 0)
+        self.lbl_burst_frames = QLabel("0")
+        bu_layout.addWidget(self.lbl_burst_frames, 7, 1)
+
+        right.addWidget(grp_burst)
+
         # Session info
         grp_info = QGroupBox("Session")
         i_layout = QGridLayout(grp_info)
@@ -575,6 +882,24 @@ class DAQWindow(QMainWindow):
         )
         self.plot_widget.addItem(self.mean_line)
 
+        # Burst markers — hidden until a frame is on screen.  The vertical line
+        # sits at t=0 (the triggering sample), the horizontal one at the level.
+        self.trig_line = pg.InfiniteLine(
+            pos=0.0, angle=90,
+            pen=pg.mkPen(color='#ff4444', width=1, style=Qt.DashLine),
+            label='trig', labelOpts={'color': '#ff4444', 'position': 0.95}
+        )
+        self.trig_line.setVisible(False)
+        self.plot_widget.addItem(self.trig_line)
+
+        self.level_line = pg.InfiniteLine(
+            pos=BURST_DEFAULT_LEVEL_V, angle=0,
+            pen=pg.mkPen(color='#ff4444', width=1, style=Qt.DotLine),
+            label='level', labelOpts={'color': '#ff4444', 'position': 0.05}
+        )
+        self.level_line.setVisible(False)
+        self.plot_widget.addItem(self.level_line)
+
         self.plot_container.addWidget(self.plot_widget)
 
     # -- Connection --------------------------------
@@ -606,6 +931,8 @@ class DAQWindow(QMainWindow):
         self._reader.stall_recovered.connect(self._on_stall_recovered)
         self._reader.resynced.connect(self._on_resynced)
         self._reader.status_changed.connect(self._on_status)
+        self._reader.burst_state.connect(self._on_burst_state)
+        self._reader.burst_frame.connect(self._on_burst_frame)
         self._reader.start()
 
         self._running      = True
@@ -621,6 +948,7 @@ class DAQWindow(QMainWindow):
             self._reader.stop()
             self._reader = None
         self._running = False
+        self._on_burst_state(BURST_STATE_STREAM)
         self.btn_connect.setText("Connect")
         self.btn_connect.setStyleSheet("")
         self.cb_port.setEnabled(True)
@@ -689,9 +1017,180 @@ class DAQWindow(QMainWindow):
                 "#ff4444" if "Error" in msg else "#888"
         self.lbl_status.setStyleSheet(f"color: {color};")
 
+    # -- Burst / trigger ---------------------------
+    def _on_burst_state(self, state):
+        self._burst_state = state
+        name = BURST_STATE_NAMES.get(state, f"? ({state})")
+        self.lbl_burst_state.setText(name)
+        self.lbl_burst_state.setStyleSheet(
+            BURST_STATE_STYLES.get(state, STYLE_INACTIVE))
+
+        engaged = (state != BURST_STATE_STREAM)
+        was_engaged = self._burst_engaged
+        self._burst_engaged = engaged
+        self.btn_burst_arm.setText("Stop" if engaged else "Arm")
+        self.btn_burst_arm.setStyleSheet(
+            "background: #8b0000;" if engaged else "")
+        self.btn_burst_force.setEnabled(engaged)
+
+        if engaged:
+            self._enter_frame_mode()
+        else:
+            self._exit_frame_mode()
+            if was_engaged:
+                self.statusBar().showMessage("Burst disarmed — streaming", 3000)
+
+    def _on_burst_frame(self, frame):
+        samples = frame["samples"]
+        if not len(samples):
+            return
+
+        self._frame_count += 1
+        self.lbl_burst_frames.setText(f"{self._frame_count:,}")
+
+        rate_idx = frame["rate_idx"]
+        if rate_idx >= len(SAMPLE_RATE_PRESETS):
+            rate_idx = self._sample_rate_index
+        rate = SAMPLE_RATE_PRESETS[rate_idx][0]
+
+        # X axis in milliseconds with t=0 on the triggering sample, so the
+        # pre-trigger window sits at negative time like a real scope.
+        trig = frame["trig"]
+        t_ms = (np.arange(len(samples), dtype=np.float64) - trig) * (1000.0 / rate)
+        volts = samples.astype(np.float32) * (VCC / ADC_MAX)
+
+        # Draw the threshold from the level the device actually triggered on,
+        # not from whatever the spin box holds now — the device snapshots it at
+        # arm time, so a mid-capture retune must not move the line on a record
+        # that already fired.
+        level = frame.get("level")
+        if level is None:
+            level = self._burst_level_counts
+        self._frame_level_counts = level
+
+        self._enter_frame_mode()
+        self.curve.setData(t_ms, volts)
+        self.trig_line.setValue(0.0)
+        self.level_line.setValue(level * (VCC / ADC_MAX))
+        self.plot_widget.setXRange(t_ms[0], t_ms[-1], padding=0.02)
+
+        # Reuse the streaming stats panel — the frame is just a frozen window.
+        vmin, vmax = float(volts.min()), float(volts.max())
+        vmean, vstd = float(volts.mean()), float(volts.std())
+        self._stats = {'min': vmin, 'max': vmax, 'mean': vmean, 'std': vstd}
+        self.lbl_current.setText(f"{vmean:.3f} V")
+        self.lbl_min.setText(f"{vmin:.3f} V")
+        self.lbl_max.setText(f"{vmax:.3f} V")
+        self.lbl_mean.setText(f"{vmean:.3f} V")
+        self.lbl_std.setText(f"{vstd:.4f} V")
+        self.mean_line.setValue(vmean)
+        self.lbl_raw_cur.setText(f"{int(samples[trig])}")
+        self.lbl_raw_min.setText(f"{int(samples.min())}")
+        self.lbl_raw_max.setText(f"{int(samples.max())}")
+
+        slope = "falling" if frame["slope"] else "rising"
+        how = "forced/auto" if frame["forced"] else slope
+        self.statusBar().showMessage(
+            f"Frame {self._frame_count}: {len(samples):,} samples @ "
+            f"{SAMPLE_RATE_PRESETS[rate_idx][1]}, trigger at {trig:,} ({how}) "
+            f"on {level * (VCC / ADC_MAX):.3f} V",
+            5000)
+
+    def _enter_frame_mode(self):
+        """Hand the plot over to the frozen frame."""
+        if self._frame_mode:
+            return
+        self._frame_mode = True
+        self._frame_level_counts = None
+        self.plot_widget.setLabel('bottom', 'Time', units='ms')
+        self.plot_widget.disableAutoRange(axis='x')
+        self.trig_line.setVisible(True)
+        # Nothing captured yet — show the level that is pending for the arm.
+        self.level_line.setValue(self._burst_level_counts * (VCC / ADC_MAX))
+        self.level_line.setVisible(True)
+        self.curve.setData([])
+
+    def _exit_frame_mode(self):
+        """Give the plot back to the live scrolling trace."""
+        if not self._frame_mode:
+            return
+        self._frame_mode = False
+        self._frame_level_counts = None
+        self.plot_widget.setLabel('bottom', 'Sample', units='')
+        self.plot_widget.enableAutoRange(axis='x')
+        self.trig_line.setVisible(False)
+        self.level_line.setVisible(False)
+        self.curve.setData([])
+
+    def _send_burst_config(self):
+        """Push every config subcode; the device snapshots them when it arms."""
+        if not self._reader:
+            return
+        _label, _action, auto_ms = BURST_MODES[self.cb_burst_mode.currentIndex()]
+        self._reader.send_burst(BURST_SUB_LEVEL,   self._burst_level_counts)
+        self._reader.send_burst(BURST_SUB_SLOPE,   self.cb_burst_slope.currentData())
+        self._reader.send_burst(BURST_SUB_PRE_PCT, self.cb_burst_pre.currentData())
+        self._reader.send_burst(BURST_SUB_LENGTH,  self.cb_burst_length.currentData())
+        self._reader.send_burst(BURST_SUB_AUTO_MS, auto_ms)
+
+    def _on_burst_arm_clicked(self):
+        if not self._reader:
+            self.statusBar().showMessage("Connect to device first!", 3000)
+            return
+        if self._burst_engaged:
+            self._reader.send_burst(BURST_SUB_ACTION, BURST_ACTION_DISARM)
+            self.statusBar().showMessage("Disarming burst…", 2000)
+            return
+
+        _label, action, _auto_ms = BURST_MODES[self.cb_burst_mode.currentIndex()]
+        self._send_burst_config()
+        self._reader.send_burst(BURST_SUB_ACTION, action)
+        self.statusBar().showMessage(
+            f"Arming burst ({self.cb_burst_mode.currentText()})", 2000)
+
+    def _on_burst_force_clicked(self):
+        if self._reader:
+            self._reader.send_burst(BURST_SUB_ACTION, BURST_ACTION_FORCE)
+
+    def _on_burst_mode_changed(self, _index):
+        if self._reader:
+            _label, _action, auto_ms = BURST_MODES[self.cb_burst_mode.currentIndex()]
+            self._reader.send_burst(BURST_SUB_AUTO_MS, auto_ms)
+
+    def _on_burst_level_changed(self, volts):
+        counts = int(round(volts / VCC * ADC_MAX))
+        self._burst_level_counts = max(0, min(ADC_MAX, counts))
+        # Only track the spin box while no captured frame is on screen; once one
+        # is, the line belongs to the level that frame fired against.
+        if self._frame_mode and self._frame_level_counts is None:
+            self.level_line.setValue(self._burst_level_counts * (VCC / ADC_MAX))
+        if self._reader:
+            self._reader.send_burst(BURST_SUB_LEVEL, self._burst_level_counts)
+
+    def _on_burst_slope_changed(self, _index):
+        if self._reader:
+            self._reader.send_burst(BURST_SUB_SLOPE,
+                                    self.cb_burst_slope.currentData())
+
+    def _on_burst_pre_changed(self, _index):
+        if self._reader:
+            self._reader.send_burst(BURST_SUB_PRE_PCT,
+                                    self.cb_burst_pre.currentData())
+
+    def _on_burst_length_changed(self, _index):
+        if self._reader:
+            self._reader.send_burst(BURST_SUB_LENGTH,
+                                    self.cb_burst_length.currentData())
+
     # -- Plot update (GUI timer) -------------------
     def _update_plot(self):
         if not self._reader:
+            return
+
+        if self._frame_mode:
+            # The frozen frame owns the curve.  Anything still in the streaming
+            # queue predates the mode switch — drop it rather than draw it.
+            self._reader.drain_samples()
             return
 
         chunks = self._reader.drain_samples()
@@ -766,9 +1265,11 @@ class DAQWindow(QMainWindow):
         self._overflow_count = 0
         self._stall_count = 0
         self._start_time   = time.time()
+        self._frame_count  = 0
         self.curve.setData([])
         self.lbl_overflow.setText("0")
         self.lbl_stalls.setText("0")
+        self.lbl_burst_frames.setText("0")
         if self._reader:
             self._reader.drain_samples()
 
