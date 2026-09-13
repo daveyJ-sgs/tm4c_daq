@@ -59,6 +59,10 @@ dropping usblib's 8 KB TX buffer freed the rest.
 - `usb_dev_serial/startup_ccs.c` — vector table (`.intvecs` via `__attribute__`)
 - `usb_dev_serial/tm4c123_daq_ccs.cmd` — linker script
 - `tm4c_daq.py` — PySide6 + PyQtGraph GUI, includes an automated test harness
+- `daq_reader.py` — wire protocol, decode, and the reader process. Imports **no
+  Qt**, deliberately: it runs in a child process so that Qt cannot stall the
+  serial drain. Both readers share its `ProtocolDecoder`, so the protocol
+  exists in exactly one place
 - `usb_test.py` — raw byte dump for diagnosing the port
 
 ## Wire protocol
@@ -137,12 +141,29 @@ the next one.
 
 ## Measured performance and limits
 
-- **The GUI is clean only to 250 kS/s**, which is not the same number. Over
-  15 s windows the full application loses 5,700-30,800 S/s at 333 kS/s with
-  repeated resyncs, because decoding competes with the plot for the GIL; 200 k
-  and 250 k measure completely clean. The bare SerialReader does 333,240 S/s
-  with zero drops, so this is the GUI, not the link. LINK_LIMIT_SPS reflects
-  the GUI figure so the UI does not promise what it cannot deliver.
+- **The GUI streams 333 kS/s cleanly, with the reader in its own process.**
+  Six fresh runs: ~332,400 S/s, zero drops, zero resyncs. Run the same binary
+  with `--thread-reader` and it loses 29,000 S/s with 20 resyncs — same code,
+  same harness, only the reader's location differs.
+
+  An earlier note here claimed the GUI was "clean only to 250 kS/s" because
+  decode competed with the plot for the GIL. The number was in the right area
+  but **the mechanism was wrong**, and acting on it wasted most of a session.
+  What is actually true:
+
+  - the Windows CDC receive buffer is a hard **16,384 bytes** and cannot be
+    grown (see the gotcha below), which at ~500 kB/s is only ~32 ms of slack;
+  - `READ_TIMEOUT` of 20 ms is quantised up to a **~31 ms** cadence, so each
+    read already holds ~15.5 kB — **95 % of the buffer before anything goes
+    wrong**;
+  - pyqtgraph's `paint()` is Python and holds the GIL. A thread wanting the
+    GIL every 1 ms was measured waiting up to **25.6 ms**, which is enough to
+    tip that buffer over.
+
+  Decode costs **0.7 % of a core**, so CPU was never the issue — it was
+  scheduling latency on the drain. A child process has its own GIL, so the GUI
+  can stall as long as it likes. Peak buffer occupancy went from pinned at
+  16,384 to a steady ~3,840 (23 %). `LINK_LIMIT_SPS` is now 340,000.
 - **333 kS/s is the safe continuous operating point**: 501.5 kB/s measured at
   the byte level = 334,365 S/s delivered, zero reported drops. 200 kS/s
   measures 300.1 kB/s = 200,040 S/s, also zero loss.
@@ -218,6 +239,31 @@ the next one.
 - Do not call `reset_input_buffer()` on the host. It cuts mid-triplet and there
   is no sync marker, so everything after it decodes as garbage. Discard whole
   reads and re-derive the offset from the `b0` invariant instead.
+- **`set_buffer_size()` is a silent no-op on this link.** It returns `True` and
+  `usbser.sys` ignores it: the receive buffer measures 16,384 bytes whether you
+  ask for 64 KB or 1 MB. Verify a buffer size by stalling the reader and
+  watching `in_waiting` plateau — never by trusting the return value.
+- **Do not shorten `READ_TIMEOUT` or poll `in_waiting` to drain faster.** Both
+  were measured and both are *worse*: 5 ms and 2 ms timeouts pinned the buffer
+  at 100 % with 33-40 resyncs, and polling did the same. A thread blocked in
+  `ReadFile` does not need the GIL while it waits; a polling thread needs it
+  every cycle, so the plot can starve a poller but not a blocker. For the same
+  reason `sys.setswitchinterval(0.0005)` and raising the reader thread's
+  priority both made things *worse* — 6 of 6 runs lossy, down to 244 kS/s.
+- **The host reader must stay in its own process.** See the performance
+  section. `--thread-reader` exists only for debugging the child.
+- **The reader process must never block sending to the GUI.** Its queue drops
+  the oldest message and counts it (`display_dropped`) instead. A blocked
+  sender stalls the serial drain, which is the exact failure the process split
+  exists to prevent. Those drops mean the *display* missed data and are
+  reported separately from firmware overflow, which means the *device* lost
+  samples.
+- **Measure in fresh processes, over >=15 s, and repeat.** In-process repeats
+  contaminated four separate experiments in one session, once producing a
+  perfectly clean 333 kS/s result that did not survive isolation — 5 of 6
+  isolated runs were lossy. Judge on peak buffer occupancy, not just
+  pass/fail: anything touching 16,384 has no margin regardless of its drop
+  count.
 
 ## Roadmap
 
@@ -227,6 +273,11 @@ the next one.
 4. **Double-packet buffering**, now that the device is actually serialised on
    one packet in flight rather than CPU-bound. Needs `usbdcdc.c` built from
    source so its binary busy flag becomes a count of packets outstanding.
+   This is now the *only* thing between us and higher streaming rates: with
+   the host reader in its own process the host is not a limit anywhere. At the
+   400 kS/s preset the device delivers ~349,000 S/s and reports ~50,400
+   dropped — which sums to the ADC rate — while the host receive buffer never
+   exceeds 25 %. Link ceiling ~352 kS/s ≈ 528 kB/s.
 5. **Burst sample rates above 400 kS/s.** Burst no longer has to respect the
    link ceiling, so the preset table is the only thing holding the rate down.
    The TM4C123 ADC is specified to 1 Msps and 400,687 S/s is simply the highest

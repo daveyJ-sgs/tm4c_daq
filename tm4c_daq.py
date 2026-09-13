@@ -50,6 +50,7 @@ condition and re-derive the offset.
 import sys
 import os
 import collections
+import multiprocessing as mp
 import queue
 import threading
 import time
@@ -66,12 +67,30 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QFont, QColor
 
+import daq_reader
+# Protocol and decode live in daq_reader, which imports no Qt so it can run in
+# the reader process.  Re-exported here because scripts and tests reach for
+# these through this module.
+from daq_reader import (
+    VCC, ADC_BITS, ADC_MAX,
+    ALIGN_TOLERANCE, ALIGN_MIN_BYTES, READ_TIMEOUT,
+    BURST_CMD,
+    BURST_SUB_ACTION, BURST_SUB_LEVEL, BURST_SUB_SLOPE,
+    BURST_SUB_PRE_PCT, BURST_SUB_LENGTH, BURST_SUB_AUTO_MS,
+    BURST_ACTION_DISARM, BURST_ACTION_ARM_SINGLE,
+    BURST_ACTION_ARM_CONT, BURST_ACTION_FORCE,
+    BURST_ST_STATE, BURST_ST_LEN_HI, BURST_ST_LEN_LO,
+    BURST_ST_TRIG_HI, BURST_ST_TRIG_LO, BURST_ST_RATE,
+    BURST_ST_FLAGS, BURST_ST_BEGIN, BURST_ST_LVL_HI, BURST_ST_LVL_LO,
+    BURST_STATE_STREAM, BURST_STATE_IDLE, BURST_STATE_ARMED,
+    BURST_STATE_TRIGGERED, BURST_STATE_FULL, BURST_STATE_DRAINING,
+    BURST_LENGTH_MIN, BURST_LENGTH_MAX,
+    ProtocolDecoder,
+)
+
 # ---------------------------------------------
 # Constants
 # ---------------------------------------------
-VCC          = 3.3              # TM4C123G ADC reference voltage (V)
-ADC_BITS     = 12               # ADC resolution
-ADC_MAX      = (1 << ADC_BITS) - 1   # 4095
 SAMPLE_RATE_PRESETS = [
     (100_000, "100 kS/s"),
     (200_000, "200 kS/s"),
@@ -81,36 +100,22 @@ SAMPLE_RATE_PRESETS = [
 ]
 DEFAULT_SAMPLE_RATE_INDEX = 1   # Default to the current reliable operating point
 
-# The highest rate THIS APPLICATION can consume without loss, which is not the
-# same as what the link can carry.  The firmware streams 333 kS/s with zero
-# loss (measured at the byte level, and through SerialReader alone: 333,240
-# S/s, 0 drops, 0 resyncs).  The full GUI cannot -- decoding competes with the
-# plot for the GIL, and over 15 s windows 333 kS/s loses 5,700-30,800 samples/s
-# with repeated resyncs.  200 k and 250 k measure completely clean.
+# The highest rate that streams without loss, measured end to end through this
+# application with the reader in its own process: 333 kS/s delivers ~332,500
+# S/s with zero drops and zero resyncs, and peak OS-buffer occupancy stays at
+# 5-50% instead of pinned at the 16 KB ceiling.
 #
-# Rates above this still acquire correctly and are the right choice for burst
-# capture; they just cannot be streamed live into this GUI.
-LINK_LIMIT_SPS = 260_000
+# The remaining limit above this is the FIRMWARE's USB link, not the host: at
+# the 400 kS/s preset the device delivers ~352,000 S/s and reports ~50,900
+# dropped, which sums to the ADC rate, while the host's receive buffer never
+# goes above 25%.  That puts the link ceiling at ~352 kS/s (~528 kB/s), and
+# lifting it is a firmware change (double-packet buffering), not a GUI one.
+LINK_LIMIT_SPS = 340_000
 
-# Triplet realignment.  Only the b0 slot is constrained (never 0xFF), so an
-# elevated 0xFF rate there means the stream has slipped.  Command triplets do
-# legitimately put 0xFF in b0 but stay well under 1% even during heavy overflow
-# reporting, while a slipped stream measures 10-90%.
-ALIGN_TOLERANCE   = 0.05
-ALIGN_MIN_BYTES   = 300         # need a reasonable sample before judging
 BUFFER_SIZE  = 2500000          # Rolling buffer (~5s at 500kHz)
 DISPLAY_WINDOW = 2000           # Default samples shown in plot
 UPDATE_HZ    = 30               # GUI refresh rate
 RATE_WINDOW_S = 2.0             # rolling window for the measured-rate readout
-
-# Serial read timeout.  This sets how much the reader thread gets per read and
-# therefore how large each numpy decode pass is.  Too short and the thread
-# wakes ~1000x a second to decode a few hundred bytes, where per-call overhead
-# dominates and the GIL is held almost continuously -- which starves the GUI
-# thread and, at high sample rates, loses bytes.
-# 20 ms measured best: at 333 kS/s through the full GUI it delivers 333,521 S/s
-# with 383 drops/s, against 270,509 S/s and 42,381 drops/s at 1 ms.
-READ_TIMEOUT = 0.020
 MAX_PLOT_POINTS = 4000          # Downsample display above this
 
 DUTY_LABELS = {0: "10%", 1: "25%", 2: "50%", 3: "75%", 4: "90%"}
@@ -124,43 +129,9 @@ STYLE_FREQ_ACTIVE   = ("background:#44aaff; color:#000; border-radius:3px; "
                         "padding:2px; font-weight:bold;")
 STYLE_FREQ_INACTIVE = "background:#333; color:#666; border-radius:3px; padding:2px;"
 
-# ---- Burst capture / trigger (protocol v1) ----
-# Host -> device is [0xFE][0xC0|sub][argHi][argLo]; device -> host is the
-# ordinary status triplet [0xFF][0xC0|sub][data].
-BURST_CMD           = 0xC0      # command/status code nibble-pair for burst
-BURST_SUB_ACTION    = 0x0
-BURST_SUB_LEVEL     = 0x1
-BURST_SUB_SLOPE     = 0x2
-BURST_SUB_PRE_PCT   = 0x3
-BURST_SUB_LENGTH    = 0x4
-BURST_SUB_AUTO_MS   = 0x5
-
-BURST_ACTION_DISARM     = 0     # return to STREAM
-BURST_ACTION_ARM_SINGLE = 1
-BURST_ACTION_ARM_CONT   = 2     # device auto-rearms after each drain
-BURST_ACTION_FORCE      = 3
-
-# Device -> host status subcodes.  0x0 is the state enum; every other subcode
-# except BEGIN is a frame header field.  BEGIN is emitted LAST regardless of its
-# number, so "is a header" is `sub != BEGIN`, never `sub < BEGIN`.
-BURST_ST_STATE   = 0x0
-BURST_ST_LEN_HI  = 0x1
-BURST_ST_LEN_LO  = 0x2
-BURST_ST_TRIG_HI = 0x3
-BURST_ST_TRIG_LO = 0x4
-BURST_ST_RATE    = 0x5
-BURST_ST_FLAGS   = 0x6
-BURST_ST_BEGIN   = 0x7
-BURST_ST_LVL_HI  = 0x8          # v2: the level this capture actually used
-BURST_ST_LVL_LO  = 0x9
-
-BURST_STATE_STREAM    = 0
-BURST_STATE_IDLE      = 1
-BURST_STATE_ARMED     = 2
-BURST_STATE_TRIGGERED = 3
-BURST_STATE_FULL      = 4
-BURST_STATE_DRAINING  = 5
-
+# ---- Burst capture / trigger: GUI presentation ----
+# The protocol constants themselves (BURST_CMD, BURST_SUB_*, BURST_ST_*,
+# BURST_ACTION_*, the state enum) live in daq_reader and are imported above.
 BURST_STATE_NAMES = {
     BURST_STATE_STREAM:    "Stream",
     BURST_STATE_IDLE:      "Idle",
@@ -192,8 +163,6 @@ BURST_MODES = [
     ("Auto",   BURST_ACTION_ARM_CONT,   BURST_AUTO_MS),
 ]
 BURST_LENGTHS      = [1024, 2048, 4096, 8192]
-BURST_LENGTH_MIN   = 64         # device clamps to 64..8192 and forces even
-BURST_LENGTH_MAX   = 8192
 BURST_PRE_PERCENTS = [0, 25, 50, 75]
 BURST_SLOPES       = [("Rising", 0), ("Falling", 1)]
 BURST_DEFAULT_LEVEL_V = VCC / 2
@@ -254,10 +223,20 @@ class RingBuffer:
 
 
 # ---------------------------------------------
-# Serial reader thread
+# Serial readers
 # ---------------------------------------------
-class SerialReader(QObject):
-    """Background thread: reads USB CDC, parses binary protocol, queues samples."""
+# Two readers with one interface.  ProcessReader is what the application uses;
+# SerialReader is kept because the hardware test scripts drive it directly and
+# because `--thread-reader` is a useful fallback when debugging the child.
+#
+# Why the process exists: the host's USB CDC receive buffer is a hard 16,384
+# bytes (set_buffer_size is a measured no-op), which at 333 kS/s holds only
+# ~32 ms of data.  pyqtgraph's paint is Python and holds the GIL; a thread
+# wanting the GIL every 1 ms was measured waiting up to 25.6 ms.  In-process,
+# 5 of 6 fresh runs lost data at 333 kS/s.  Out-of-process, 4 of 4 were clean.
+# Decode itself costs 0.7 % of a core -- this was never about CPU.
+class _ReaderBase(QObject):
+    """Signals, the sample queue, and event dispatch shared by both readers."""
 
     duty_changed   = Signal(int)    # Duty index 0-4
     freq_changed   = Signal(int)    # Frequency index 0-4
@@ -271,23 +250,79 @@ class SerialReader(QObject):
 
     def __init__(self, port, baud=115200):
         super().__init__()
-        self.port         = port
-        self.baud         = baud          # Ignored by USB CDC, required by pyserial
+        self.port = port
+        self.baud = baud            # Ignored by USB CDC, required by pyserial
+
+        self._samples_lock = threading.Lock()
+        self._sample_chunks = collections.deque()
+
+        # Link health, published by the reader process every 0.5 s.  peak_queue
+        # is occupancy of the 16,384-byte OS receive buffer since the last
+        # report and is the single most useful number for spotting a stalled
+        # drain before it turns into lost bytes.  display_dropped counts
+        # messages the child threw away because the GUI fell behind -- distinct
+        # from firmware overflow, which means the device lost samples.
+        self.peak_queue = 0
+        self.display_dropped = 0
+
+    # -- consumed by the GUI -----------------------
+    def drain_samples(self):
+        """Return all decoded sample chunks received since the last GUI update."""
+        with self._samples_lock:
+            if not self._sample_chunks:
+                return []
+            chunks = list(self._sample_chunks)
+            self._sample_chunks.clear()
+            return chunks
+
+    def send_burst(self, sub, arg):
+        """Queue a 4-byte burst command [0xFE][0xC0|sub][argHi][argLo]."""
+        self.send(daq_reader.burst_command(sub, arg))
+
+    # -- event fan-out -----------------------------
+    def _dispatch(self, kind, value):
+        """Turn one decoder event into the matching Qt signal."""
+        if kind == daq_reader.EV_SAMPLES:
+            with self._samples_lock:
+                self._sample_chunks.append(value)
+        elif kind == daq_reader.EV_DUTY:
+            self.duty_changed.emit(value)
+        elif kind == daq_reader.EV_FREQ:
+            self.freq_changed.emit(value)
+        elif kind == daq_reader.EV_RATE:
+            self.sample_rate_changed.emit(value)
+        elif kind == daq_reader.EV_OVERFLOW:
+            self.overflow_delta.emit(value)
+        elif kind == daq_reader.EV_STALL:
+            self.stall_recovered.emit(value)
+        elif kind == daq_reader.EV_RESYNC:
+            self.resynced.emit(value)
+        elif kind == daq_reader.EV_BURST_STATE:
+            self.burst_state.emit(value)
+        elif kind == daq_reader.EV_BURST_FRAME:
+            self.burst_frame.emit(value)
+        elif kind == daq_reader.EV_STATUS:
+            self.status_changed.emit(value)
+        elif kind == daq_reader.EV_STATS:
+            self.peak_queue = value.get("peak_queue", 0)
+            self.display_dropped = value.get("display_dropped", 0)
+
+
+class SerialReader(_ReaderBase):
+    """In-process reader: a background thread owns the port.
+
+    Retained for the hardware test scripts and as a debugging fallback.  It is
+    NOT the application's default, because Qt's paint can stall this thread for
+    longer than the 16 KB OS receive buffer can absorb.
+    """
+
+    def __init__(self, port, baud=115200):
+        super().__init__(port, baud)
         self._stop        = threading.Event()
         self._thread      = threading.Thread(target=self._run, daemon=True)
         self._ser         = None
-        self._write_queue = queue.SimpleQueue()  # GUI thread → reader thread writes
-        self._samples_lock = threading.Lock()
-        self._sample_chunks = collections.deque()
-        self._resync_count = 0
-
-        # Burst frame assembly.  The header subcodes land in _burst_hdr as they
-        # arrive; BEGIN switches the decoder into collecting mode, where whole
-        # triplet rows are appended to _burst_accum until _burst_needed samples
-        # have been gathered.  Payload samples never reach the streaming queue.
-        self._burst_hdr    = {}
-        self._burst_accum  = []
-        self._burst_needed = 0
+        self._write_queue = queue.SimpleQueue()  # GUI thread -> reader thread
+        self._decoder     = ProtocolDecoder(self._dispatch)
 
     def start(self):
         self._stop.clear()
@@ -301,237 +336,129 @@ class SerialReader(QObject):
         """Queue bytes for the reader thread to write (thread-safe)."""
         self._write_queue.put(data)
 
-    def drain_samples(self):
-        """Return all decoded sample chunks received since the last GUI update."""
-        with self._samples_lock:
-            if not self._sample_chunks:
-                return []
-            chunks = list(self._sample_chunks)
-            self._sample_chunks.clear()
-            return chunks
-
-    def send_burst(self, sub, arg):
-        """Queue a 4-byte burst command [0xFE][0xC0|sub][argHi][argLo]."""
-        self.send(bytes([0xFE, BURST_CMD | (sub & 0x0F),
-                         (arg >> 8) & 0xFF, arg & 0xFF]))
-
-    def _queue_samples(self, samples):
-        with self._samples_lock:
-            self._sample_chunks.append(samples)
-
-    # -- Burst frame assembly ----------------------
-    @staticmethod
-    def _decode_triplets(t):
-        """Vectorized triplet → sample decode.  t is an N×3 uint8 array."""
-        b0 = t[:, 0].astype(np.uint16)
-        b1 = t[:, 1].astype(np.uint16)
-        b2 = t[:, 2].astype(np.uint16)
-        samples = np.empty(len(t) * 2, dtype=np.uint16)
-        samples[0::2] = (b0 << 4) | (b1 >> 4)
-        samples[1::2] = ((b1 & 0x0F) << 8) | b2
-        return samples
-
-    def _begin_burst(self):
-        """BEGIN seen — snapshot the header and switch into collecting mode."""
-        length = ((self._burst_hdr.get(BURST_ST_LEN_HI, 0) << 8)
-                  | self._burst_hdr.get(BURST_ST_LEN_LO, 0))
-        if (length < BURST_LENGTH_MIN or length > BURST_LENGTH_MAX
-                or length % 2):
-            # Header lost or corrupt — drop the frame rather than swallow an
-            # arbitrary slice of the stream as payload.
-            self._burst_hdr = {}
-            return False
-        self._burst_needed = length
-        self._burst_accum = []
-        return True
-
-    def _finish_burst(self):
-        """Payload complete — decode it and hand the frame to the GUI."""
-        hdr = self._burst_hdr
-        length = (hdr.get(BURST_ST_LEN_HI, 0) << 8) | hdr.get(BURST_ST_LEN_LO, 0)
-        trig = (hdr.get(BURST_ST_TRIG_HI, 0) << 8) | hdr.get(BURST_ST_TRIG_LO, 0)
-        flags = hdr.get(BURST_ST_FLAGS, 0)
-
-        # The level the capture actually fired against (v2).  Absent from a v1
-        # device — report None rather than 0 so the GUI falls back to its own
-        # pending value instead of drawing the threshold down at 0 V.
-        if BURST_ST_LVL_HI in hdr or BURST_ST_LVL_LO in hdr:
-            level = ((hdr.get(BURST_ST_LVL_HI, 0) << 8)
-                     | hdr.get(BURST_ST_LVL_LO, 0))
-        else:
-            level = None
-
-        if self._burst_accum:
-            t = (self._burst_accum[0] if len(self._burst_accum) == 1
-                 else np.concatenate(self._burst_accum))
-            samples = self._decode_triplets(t)[:length]
-        else:
-            samples = np.array([], dtype=np.uint16)
-
-        self._burst_hdr    = {}
-        self._burst_accum  = []
-        self._burst_needed = 0
-
-        self.burst_frame.emit({
-            "samples":  samples,
-            "trig":     min(trig, max(len(samples) - 1, 0)),
-            "rate_idx": hdr.get(BURST_ST_RATE, 0),
-            "slope":    flags & 0x01,
-            "forced":   bool(flags & 0x02),
-            "level":    level,
-        })
-
-    def _process_triplets(self, t):
-        """Split a read into burst payload runs and ordinary stream triplets.
-
-        Burst payload is order-sensitive: it is the contiguous run immediately
-        after BEGIN.  Everything outside that run goes through the usual
-        mask-based streaming decode, which does not care about ordering.
-        """
-        while len(t):
-            if self._burst_needed > 0:
-                want = (self._burst_needed + 1) // 2      # len is always even
-                take = min(want, len(t))
-                self._burst_accum.append(t[:take])
-                self._burst_needed -= take * 2
-                t = t[take:]
-                if self._burst_needed <= 0:
-                    self._finish_burst()
-                continue
-
-            # Not collecting — look for the next BEGIN triplet.
-            begins = np.flatnonzero((t[:, 0] == 0xFF)
-                                    & (t[:, 1] == (BURST_CMD | BURST_ST_BEGIN)))
-            if not begins.size:
-                self._process_stream(t)
-                return
-
-            idx = int(begins[0])
-            self._process_stream(t[:idx])       # header subcodes live in here
-            t = t[idx + 1:]                     # BEGIN itself is consumed
-            self._begin_burst()
-
-    def _process_stream(self, t):
-        """The original streaming decode: order-independent, fully vectorized."""
-        if not len(t):
-            return
-
-        b0 = t[:, 0]
-        b1 = t[:, 1].astype(np.uint16)
-        b2 = t[:, 2].astype(np.uint16)
-
-        is_cmd  = (b0 == 0xFF)
-        is_data = ~is_cmd
-
-        # Command triplets — iterate (rare, at most a few per button press)
-        if is_cmd.any():
-            for cmd_b0, cmd_b1, cmd_b2 in t[is_cmd]:
-                cmd = int(cmd_b1)
-                code = cmd & 0xF0
-                arg = cmd & 0x0F
-                if code == 0x40:
-                    self.duty_changed.emit(arg)
-                elif code == 0x20:
-                    self.freq_changed.emit(arg)
-                elif code == 0x60:
-                    self.sample_rate_changed.emit(arg)
-                elif code == 0x80:
-                    delta = (arg << 8) | int(cmd_b2)
-                    self.overflow_delta.emit(delta)
-                elif code == 0xA0:
-                    self.stall_recovered.emit(arg)
-                elif code == BURST_CMD:
-                    data = int(cmd_b2)
-                    if arg == BURST_ST_STATE:
-                        self.burst_state.emit(data)
-                    elif arg != BURST_ST_BEGIN:
-                        # Frame header.  BEGIN is emitted last but is not the
-                        # highest subcode, so this must not be a `<` test.
-                        self._burst_hdr[arg] = data
-                    # BEGIN never reaches here; _process_triplets consumes it.
-
-        # Data triplets — fully vectorized, no Python loop
-        if is_data.any():
-            db0 = b0[is_data].astype(np.uint16)
-            db1 = b1[is_data]
-            db2 = b2[is_data]
-            sA = (db0 << 4) | (db1 >> 4)
-            sB = ((db1 & 0x0F) << 8) | db2
-            samples = np.empty(len(sA) * 2, dtype=np.uint16)
-            samples[0::2] = sA
-            samples[1::2] = sB
-            self._queue_samples(samples)
-
     def _run(self):
         try:
-            ser = serial.Serial(self.port, self.baud, timeout=READ_TIMEOUT)
-            if hasattr(ser, "set_buffer_size"):
-                try:
-                    ser.set_buffer_size(rx_size=1 << 20, tx_size=1 << 16)
-                except (AttributeError, OSError, ValueError):
-                    pass
+            ser = daq_reader.open_port(self.port, self.baud)
             self._ser = ser
             self.status_changed.emit(f"Connected: {self.port} (USB CDC)")
         except serial.SerialException as e:
             self.status_changed.emit(f"Error: {e}")
             return
 
-        # Startup drain: DTR flush has already told the firmware to reset its TX
-        # buffer, but Windows may have buffered some pre-flush bytes already.
-        # Wait briefly for the flush to propagate, then discard whatever is in
-        # the Windows receive buffer so decoding starts at a clean triplet boundary.
-        time.sleep(0.08)
-        ser.read(65536)     # discard pre-flush bytes
-
-        # Numpy vectorized triplet decoder.
-        # Protocol: every 3 bytes is either a data triplet or command triplet.
-        #   data:    b0 != 0xFF → sA=(b0<<4)|(b1>>4), sB=((b1&0xF)<<8)|b2
-        #   command: b0 == 0xFF → [0xFF][0x20|fi or 0x40|di][0x00]
-        # We maintain up to 2 leftover bytes between reads to keep triplet alignment.
-        leftover = b''
-
+        peak = 0
         try:
             while not self._stop.is_set():
-                # Drain write queue first — keeps all port I/O on this thread.
+                # Drain write queue first -- keeps all port I/O on this thread.
                 while not self._write_queue.empty():
                     ser.write(self._write_queue.get_nowait())
 
-                raw = ser.read(65536)
-                if not raw:
-                    continue
+                try:
+                    q = ser.in_waiting
+                    if q > peak:
+                        peak = q
+                        self.peak_queue = peak
+                except (OSError, serial.SerialException):
+                    pass
 
-                buf = np.frombuffer(leftover + raw, dtype=np.uint8)
-
-                # Triplet alignment guard.  The protocol has no sync marker, so
-                # a single lost or duplicated byte would garble every sample
-                # from here on with nothing to signal it.  Data triplets never
-                # start with 0xFF; if the b0 slot says otherwise, re-derive the
-                # offset from the slot that does satisfy the invariant.
-                # Suppressed mid-frame: a burst payload is pure data, so the
-                # b0 invariant cannot fire legitimately there, and a false
-                # positive would shear the frame in half.
-                if len(buf) >= ALIGN_MIN_BYTES and self._burst_needed <= 0:
-                    rates = [float((buf[o::3] == 0xFF).mean()) for o in range(3)]
-                    best = min(range(3), key=lambda o: rates[o])
-                    if best != 0 and rates[0] > ALIGN_TOLERANCE                             and rates[best] < rates[0] / 4:
-                        buf = buf[best:]
-                        self._resync_count += 1
-                        self.resynced.emit(self._resync_count)
-
-                n_triplets = len(buf) // 3
-                leftover = bytes(buf[n_triplets * 3:])  # save 0-2 bytes
-
-                if n_triplets == 0:
-                    continue
-
-                # Reshape to column vectors: each row is one triplet [b0, b1, b2]
-                self._process_triplets(
-                    buf[:n_triplets * 3].reshape(n_triplets, 3))
+                self._decoder.feed(ser.read(65536))
         finally:
             self._ser = None
             ser.close()
             self.status_changed.emit("Disconnected")
 
+
+class ProcessReader(_ReaderBase):
+    """Out-of-process reader: a child process owns the port.
+
+    The child has its own interpreter and its own GIL, so no amount of plotting
+    in this process can delay the drain.  Only decoded samples and small events
+    cross the pipe; the child never blocks on this side, dropping and counting
+    instead, because a blocked sender would stall the drain.
+    """
+
+    def __init__(self, port, baud=115200):
+        super().__init__(port, baud)
+        self._proc = None
+        self._cmd_tx = None
+        self._data_rx = None
+        self._rx_thread = None
+        self._stop = threading.Event()
+
+    def start(self):
+        ctx = mp.get_context("spawn")
+        cmd_rx, self._cmd_tx = ctx.Pipe(duplex=False)
+        self._data_rx, data_tx = ctx.Pipe(duplex=False)
+
+        self._stop.clear()
+        self._proc = ctx.Process(
+            target=daq_reader.reader_main,
+            args=(self.port, cmd_rx, data_tx, self.baud),
+            daemon=True,
+        )
+        self._proc.start()
+
+        # The child holds its own duplicates; closing ours here means recv()
+        # raises EOFError when the child exits instead of blocking forever.
+        cmd_rx.close()
+        data_tx.close()
+
+        self._rx_thread = threading.Thread(target=self._receive, daemon=True)
+        self._rx_thread.start()
+        self.status_changed.emit(f"Starting reader for {self.port}...")
+
+    def stop(self):
+        self._stop.set()
+        try:
+            if self._cmd_tx is not None:
+                self._cmd_tx.send(("stop", None))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
+        if self._proc is not None:
+            self._proc.join(timeout=2.0)
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=1.0)
+            self._proc = None
+
+        for conn in (self._cmd_tx, self._data_rx):
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+        self._cmd_tx = None
+        self._data_rx = None
+
+        if self._rx_thread is not None:
+            self._rx_thread.join(timeout=1.0)
+            self._rx_thread = None
+
+    def send(self, data):
+        try:
+            if self._cmd_tx is not None:
+                self._cmd_tx.send(("write", data))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
+    def _receive(self):
+        """Block on the pipe and fan messages out as Qt signals.
+
+        This thread can be starved by the GUI without consequence: the child is
+        the one draining the serial port, and the pipe buffers far more
+        generously than the 16 KB the OS gives the COM port.
+        """
+        conn = self._data_rx
+        while not self._stop.is_set():
+            try:
+                kind, value = conn.recv()
+            except (EOFError, OSError):
+                break
+            self._dispatch(kind, value)
+
+
+# Which reader the GUI builds.  Overridden to SerialReader by --thread-reader.
+READER_CLASS = ProcessReader
 
 # ---------------------------------------------
 # Main Window
@@ -941,7 +868,7 @@ class DAQWindow(QMainWindow):
             self.statusBar().showMessage("Select a valid COM port")
             return
 
-        self._reader = SerialReader(port)
+        self._reader = READER_CLASS(port)
         self._reader.duty_changed.connect(self._on_duty_changed)
         self._reader.freq_changed.connect(self._on_freq_changed)
         self._reader.sample_rate_changed.connect(self._on_sample_rate_changed)
@@ -1339,6 +1266,10 @@ class DAQWindow(QMainWindow):
         self._test_harness.start()
 
     def closeEvent(self, event):
+        # The refresh timer is started in __init__ and nothing else ever stops
+        # it, so without this a closed window keeps calling _update_plot at
+        # UPDATE_HZ for the life of the process.
+        self._timer.stop()
         self._disconnect()
         event.accept()
 
@@ -1516,6 +1447,16 @@ class TestHarness(QObject):
 # Entry point
 # ---------------------------------------------
 if __name__ == "__main__":
+    # Required before any Process is created when this is ever frozen; harmless
+    # otherwise.  The reader child re-imports daq_reader only, not this module.
+    mp.freeze_support()
+
+    if "--thread-reader" in sys.argv:
+        # Fallback for debugging the child: runs the reader in this process,
+        # which is measurably lossy above ~250 kS/s.
+        READER_CLASS = SerialReader
+        sys.argv.remove("--thread-reader")
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
