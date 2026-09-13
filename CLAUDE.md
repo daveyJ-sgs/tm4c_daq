@@ -46,15 +46,16 @@ Two build warnings are expected and harmless: the `wchar_t` mismatch between
 tiarmclang and the pre-built TivaWare libs, and the `tiobj2bin` post-build
 failure (it only affects `.bin`; the `.out` flashes fine).
 
-Current footprint: ~19.6 KB of 256 KB flash, 31,673 of 32,768 B SRAM
-(**~1.1 KB free** — the ADC ring is 16 KB and the USB TX buffer 8 KB).
-There is no room for a second capture buffer, which is why burst mode reuses
-the streaming ring and the two modes are mutually exclusive.
+Current footprint: ~20.5 KB of 256 KB flash, 27,593 of 32,768 B SRAM
+(**~5.1 KB free** — the ADC ring is 16 KB and the transmit ring 4 KB).
+Burst mode still reuses the streaming ring, from when only 1.1 KB was free;
+dropping usblib's 8 KB TX buffer freed the rest.
 
 ## Source layout
 
 - `usb_dev_serial/main.c` — everything: ADC, uDMA, PWM, USB, protocol
-- `usb_dev_serial/usb_serial_structs.c/.h` — CDC descriptors, TX 8192 / RX 256
+- `usb_dev_serial/usb_serial_structs.c/.h` — CDC descriptors, RX buffer 256.
+  There is deliberately **no TX `tUSBBuffer`** — see the transmit-path gotcha
 - `usb_dev_serial/startup_ccs.c` — vector table (`.intvecs` via `__attribute__`)
 - `usb_dev_serial/tm4c123_daq_ccs.cmd` — linker script
 - `tm4c_daq.py` — PySide6 + PyQtGraph GUI, includes an automated test harness
@@ -136,26 +137,47 @@ the next one.
 
 ## Measured performance and limits
 
-- **200 kS/s is the safe continuous operating point**: 100.0 % delivered, zero
-  loss over 10 s soaks.
+- **333 kS/s is the safe continuous operating point**: 501.5 kB/s measured at
+  the byte level = 334,365 S/s delivered, zero reported drops. 200 kS/s
+  measures 300.1 kB/s = 200,040 S/s, also zero loss.
 - The **ADC/uDMA path is not the bottleneck** — it hits 400,687 S/s on command.
-- The **USB CDC link is**: ~358 kB/s ≈ 239 kS/s. Anything above that is dropped
-  at the ring and reported via the `0x80` telemetry. Accounting balances to
-  within 0.1 % (e.g. at 400 kS/s: 242,235 delivered + 157,564 reported drops).
+- The **USB CDC link is**, at ~516 kB/s ≈ 344 kS/s peak. Anything above that
+  is dropped at the ring and reported via the `0x80` telemetry; accounting
+  balances to within 0.1 %.
 - **Burst capture is not subject to any of this.** All five presets return a
   complete 8192-sample frame with the trigger at exactly the requested offset,
   acquired rate measured from the data itself against the known PWM period:
   100 k, 200 k, 250 k and 400 k all land at +0.00 %, and 333 k at 333,320 S/s
   (-0.004 %).  The 333 k and 400 k presets cannot be streamed at all.
 
-- That ~358 kB/s is only **25–30 % of the USB Full-Speed bulk ceiling**
-  (~1.216 MB/s). The limit is usblib: both `usbdcdc` and `usbdbulk` allow only
-  one 64-byte packet in flight. Double-packet buffering was tried, verified set
-  in hardware (`TXFIFOSZ = 0x13`), and made no difference — the class state
-  machine never stages the second packet. Going faster needs a custom bulk class
-  with endpoint uDMA and a WinUSB host.
+- That ~516 kB/s is **42 % of the USB Full-Speed bulk ceiling** (~1.216 MB/s,
+  19 × 64 B per 1 ms frame), up from 29 % before the transmit path was
+  rewritten.
+- **What the remaining limit is.** With the copy cost gone, the transmit ring
+  is now never empty (measured 0 %) and 94 % of send attempts find the class
+  still busy with the previous packet — so the device is genuinely serialised
+  on one packet in flight. *That* is what double-packet buffering addresses,
+  and it is the next thing to try. It was tried once before and did nothing,
+  which was correct at the time: the bottleneck then was CPU in the copy, not
+  packets in flight, so a second FIFO slot could not have helped.
 
 ## Gotchas
+
+- **Do not use `USBBufferWrite` on the transmit side.** `USBRingBufWrite`
+  copies one byte at a time through `UpdateIndexAtomic`, which globally
+  disables and re-enables interrupts *per byte* — 768 function calls and 768
+  CPSID/CPSIE pairs for one 768-byte batch. Measured at **1,564 µs per call
+  and 69.9 % of the CPU**, against 17.4 % for the entire USB interrupt
+  handler. `main.c` keeps its own transmit ring and hands the CDC class whole
+  64-byte packets instead; filling and draining are both `memcpy`.
+- **Flushing that ring must be deferred to the main loop.** `ControlHandler`
+  runs in USB interrupt context and the main loop is the ring's only producer.
+  A flush landing between the producer's `memcpy` and its head update puts the
+  stale head back, and the device then transmits kilobytes of stale bytes —
+  which, with no sync marker in the protocol, the host never recovers from.
+- **Re-read the free space after servicing the status queue**, since those
+  writes go into the same ring. Sizing a sample batch from a figure taken
+  before them overruns the ring by up to a full status queue.
 
 - **Attaching a debugger halts the CPU and strands the uDMA ping-pong** with
   both halves `STOP`ped. A SysTick watchdog now detects stalled acquisition
@@ -196,11 +218,14 @@ the next one.
 1. ~~uDMA ping-pong for the ADC~~ — done
 2. ~~Burst capture~~ — done
 3. ~~Trigger system~~ — done (edge, pre-trigger, auto/normal/single)
-4. **Burst sample rates above 400 kS/s.** Burst no longer has to respect the
+4. **Double-packet buffering**, now that the device is actually serialised on
+   one packet in flight rather than CPU-bound. Needs `usbdcdc.c` built from
+   source so its binary busy flag becomes a count of packets outstanding.
+5. **Burst sample rates above 400 kS/s.** Burst no longer has to respect the
    link ceiling, so the preset table is the only thing holding the rate down.
    The TM4C123 ADC is specified to 1 Msps and 400,687 S/s is simply the highest
    preset we have, not a measured limit. Add presets and verify the achieved
    rate the same way — deliberately as its own step, not folded into another
    change.
-5. Scope GUI — timebase, cursors, FFT, measurements
-6. Multi-channel, analog frontend
+6. Scope GUI — timebase, cursors, FFT, measurements
+7. Multi-channel, analog frontend

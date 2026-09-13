@@ -62,6 +62,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include "inc/hw_ints.h"
 #include "inc/hw_memmap.h"
 #include "inc/hw_types.h"
@@ -267,11 +268,45 @@ static volatile uint8_t g_ui8CmdFreqIndex = 0;
 static volatile uint8_t g_ui8CmdDutyIndex = 0;
 static volatile uint8_t g_ui8CmdSampleRateIndex = 0;
 
-// USB batch write buffer for high-throughput streaming
-// Must be a multiple of 3 (3 bytes per 2-sample triplet)
+// USB batch encode buffer.  Must be a multiple of 3 (3 bytes per triplet).
 #define USB_BATCH_BYTES     768
 
 static uint8_t g_pui8USBBatch[USB_BATCH_BYTES];
+
+//*****************************************************************************
+// Transmit path
+//
+// usblib's tUSBBuffer is NOT used for transmit.  USBBufferWrite copies into
+// its ring one byte at a time via USBRingBufWriteOne, and every single byte
+// goes through UpdateIndexAtomic, which globally disables and re-enables
+// interrupts.  That is 768 function calls and 768 CPSID/CPSIE pairs for one
+// 768-byte batch: measured at 1,564 us per call and 69.9% of the CPU, against
+// 17.4% for the entire USB interrupt handler.  That call, not the USB bus and
+// not the number of packets in flight, was what held the link to ~350 kB/s --
+// which is also why enabling double-packet buffering made no difference.
+//
+// We keep our own byte ring instead and hand the CDC class whole 64-byte
+// packets.  Filling it is a memcpy and draining it is a memcpy.
+//
+// Single producer (main loop writes g_ui32TxHead), single consumer (the USB
+// interrupt advances g_ui32TxTail), so no lock is needed on the indices
+// themselves -- both are naturally aligned 32-bit stores.  The main loop does
+// mask the USB interrupt around its own call to TxPumpPacket, because that
+// one function is genuinely reachable from both contexts.
+//*****************************************************************************
+#define TX_RING_SIZE        4096            // power of 2
+#define TX_RING_MASK        (TX_RING_SIZE - 1)
+#define USB_PACKET_BYTES    64              // Full-Speed bulk max packet
+
+static uint8_t           g_pui8TxRing[TX_RING_SIZE];
+static uint8_t           g_pui8TxPacket[USB_PACKET_BYTES];
+static volatile uint32_t g_ui32TxHead = 0;
+static volatile uint32_t g_ui32TxTail = 0;
+
+//
+// Set from the USB interrupt, honoured by the main loop.  See TxRingFlush.
+//
+static volatile bool     g_bTxFlushPending = false;
 
 // Pending status triplets (command echoes, overflow reports, stall recoveries).
 //
@@ -356,6 +391,157 @@ TimerApplySampleRate(void)
 }
 
 //*****************************************************************************
+// Transmit ring helpers
+//*****************************************************************************
+static uint32_t
+TxRingUsed(void)
+{
+    return((g_ui32TxHead - g_ui32TxTail) & TX_RING_MASK);
+}
+
+static uint32_t
+TxRingFree(void)
+{
+    //
+    // One slot is always left empty so that head == tail means empty rather
+    // than ambiguously full.
+    //
+    return(TX_RING_MASK - TxRingUsed());
+}
+
+static void
+TxRingWrite(const uint8_t *pui8Data, uint32_t ui32Len)
+{
+    uint32_t ui32At;
+    uint32_t ui32First;
+    uint32_t ui32Room = TxRingFree();
+
+    //
+    // Callers size their writes from TxRingFree() and must not over-ask, but
+    // clamp anyway: overrunning here walks head past tail, and because the
+    // wire protocol has no sync marker the host would never recover.  Keep
+    // the clamp on a triplet boundary so a truncated write cannot shift every
+    // following sample by a byte.
+    //
+    if(ui32Len > ui32Room)
+    {
+        ui32Len = ui32Room - (ui32Room % 3);
+        if(ui32Len == 0)
+        {
+            return;
+        }
+    }
+
+    ui32At = g_ui32TxHead & TX_RING_MASK;
+    ui32First = TX_RING_SIZE - ui32At;
+
+    if(ui32First > ui32Len)
+    {
+        ui32First = ui32Len;
+    }
+
+    memcpy(&g_pui8TxRing[ui32At], pui8Data, ui32First);
+    if(ui32Len > ui32First)
+    {
+        memcpy(&g_pui8TxRing[0], pui8Data + ui32First, ui32Len - ui32First);
+    }
+
+    g_ui32TxHead = (g_ui32TxHead + ui32Len) & TX_RING_MASK;
+}
+
+//*****************************************************************************
+// Hand one packet to the CDC class if it is idle and we have bytes.
+//
+// Reachable from the USB interrupt (on TX complete) and from the main loop
+// (to restart the chain once it has drained).  The main loop masks INT_USB0
+// around its call; the interrupt path cannot be preempted by the main loop.
+//*****************************************************************************
+static void
+TxPumpPacket(void)
+{
+    uint32_t ui32Used = TxRingUsed();
+    uint32_t ui32Len;
+    uint32_t ui32At;
+    uint32_t ui32First;
+
+    if(ui32Used == 0)
+    {
+        return;
+    }
+
+    //
+    // Zero means the class is still sending the previous packet.
+    //
+    if(USBDCDCTxPacketAvailable((void *)&g_sCDCDevice) == 0)
+    {
+        return;
+    }
+
+    ui32Len = (ui32Used > USB_PACKET_BYTES) ? USB_PACKET_BYTES : ui32Used;
+    ui32At = g_ui32TxTail & TX_RING_MASK;
+    ui32First = TX_RING_SIZE - ui32At;
+    if(ui32First > ui32Len)
+    {
+        ui32First = ui32Len;
+    }
+
+    memcpy(g_pui8TxPacket, &g_pui8TxRing[ui32At], ui32First);
+    if(ui32Len > ui32First)
+    {
+        memcpy(g_pui8TxPacket + ui32First, &g_pui8TxRing[0],
+               ui32Len - ui32First);
+    }
+
+    if(USBDCDCPacketWrite((void *)&g_sCDCDevice, g_pui8TxPacket, ui32Len,
+                          true) == ui32Len)
+    {
+        g_ui32TxTail = (g_ui32TxTail + ui32Len) & TX_RING_MASK;
+    }
+}
+
+//*****************************************************************************
+// Request that the transmit ring be emptied.
+//
+// Called from USB interrupt context (connect, and DTR when the host opens the
+// port).  It must NOT zero the indices here: the main loop is the only
+// producer, and a flush landing between its memcpy and its update of
+// g_ui32TxHead would put the stale head back, making used jump to whatever
+// happened to be in the ring.  The device would then transmit kilobytes of
+// stale bytes and the host, which has no sync marker, would lose triplet
+// alignment permanently.  Defer it to the producer.
+//*****************************************************************************
+static void
+TxRingFlush(void)
+{
+    g_bTxFlushPending = true;
+}
+
+//*****************************************************************************
+// Honour a pending flush.  Main loop only, and never mid-write by
+// construction.  Masking the USB interrupt keeps the consumer out.
+//*****************************************************************************
+static void
+TxRingServiceFlush(void)
+{
+    if(!g_bTxFlushPending)
+    {
+        return;
+    }
+
+    g_bTxFlushPending = false;
+
+    MAP_IntDisable(INT_USB0);
+    g_ui32TxHead = 0;
+    g_ui32TxTail = 0;
+    MAP_IntEnable(INT_USB0);
+
+    //
+    // Anything queued belonged to the previous reader.
+    //
+    g_ui8StatusTail = g_ui8StatusHead;
+}
+
+//*****************************************************************************
 // USB CDC Callbacks
 //*****************************************************************************
 uint32_t
@@ -366,7 +552,7 @@ ControlHandler(void *pvCBData, uint32_t ui32Event,
     {
         case USB_EVENT_CONNECTED:
             g_bUSBConfigured = true;
-            USBBufferFlush(&g_sTxBuffer);
+            TxRingFlush();
             USBBufferFlush(&g_sRxBuffer);
             MAP_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_2, GPIO_PIN_2);
             break;
@@ -388,7 +574,7 @@ ControlHandler(void *pvCBData, uint32_t ui32Event,
             //
             if(ui32MsgValue & 0x01)     // bit 0 = DTR
             {
-                USBBufferFlush(&g_sTxBuffer);
+                TxRingFlush();
             }
             break;
 
@@ -405,10 +591,21 @@ ControlHandler(void *pvCBData, uint32_t ui32Event,
     return(0);
 }
 
+//*****************************************************************************
+// CDC transmit-complete callback (USB interrupt context)
+//
+// usbdcdc clears its TX state to idle before calling us, so the next packet
+// can be staged immediately from here.
+//*****************************************************************************
 uint32_t
 TxHandler(void *pvCBData, uint32_t ui32Event, uint32_t ui32MsgValue,
           void *pvMsgData)
 {
+    if(ui32Event == USB_EVENT_TX_COMPLETE)
+    {
+        TxPumpPacket();
+    }
+
     return(0);
 }
 
@@ -989,7 +1186,6 @@ ConfigurePWM(void)
 static void
 ConfigureUSB(void)
 {
-    USBBufferInit(&g_sTxBuffer);
     USBBufferInit(&g_sRxBuffer);
     USBStackModeSet(0, eUSBModeForceDevice, 0);
     USBDCDCInit(0, &g_sCDCDevice);
@@ -1071,7 +1267,7 @@ ServiceStatusQueue(void)
         // Only write a whole triplet.  A partial write would shift every later
         // sample by a byte and the protocol has no way to resynchronise.
         //
-        if(USBBufferSpaceAvailable(&g_sTxBuffer) < 3)
+        if(TxRingFree() < 3)
         {
             return;
         }
@@ -1080,7 +1276,7 @@ ServiceStatusQueue(void)
         pui8Pkt[1] = g_pui8StatusQueue[g_ui8StatusTail][0];
         pui8Pkt[2] = g_pui8StatusQueue[g_ui8StatusTail][1];
 
-        USBBufferWrite(&g_sTxBuffer, pui8Pkt, 3);
+        TxRingWrite(pui8Pkt, 3);
         g_ui8StatusTail = (g_ui8StatusTail + 1) & STATUS_QUEUE_MASK;
     }
 }
@@ -1162,7 +1358,7 @@ BurstQueueHeader(void)
 static bool
 BurstDrainBatch(void)
 {
-    uint32_t ui32Space = USBBufferSpaceAvailable(&g_sTxBuffer);
+    uint32_t ui32Space = TxRingFree();
     uint32_t ui32Limit;
     uint32_t ui32Bytes = 0;
 
@@ -1190,7 +1386,7 @@ BurstDrainBatch(void)
 
     if(ui32Bytes)
     {
-        USBBufferWrite(&g_sTxBuffer, g_pui8USBBatch, ui32Bytes);
+        TxRingWrite(g_pui8USBBatch, ui32Bytes);
     }
 
     return(g_ui32DrainLeft == 0);
@@ -1249,6 +1445,11 @@ main(void)
             g_ui32StallRecoveries++;
             SendUSBCommand(0xA0 | (uint8_t)(g_ui32StallRecoveries & 0x0F));
         }
+
+        //
+        // Honour a deferred transmit-ring flush before writing anything.
+        //
+        TxRingServiceFlush();
 
         //
         // Report burst state transitions from here rather than from the ISR:
@@ -1338,7 +1539,7 @@ main(void)
         {
             uint32_t ui32Tail = g_ui32ADCTail;
             uint32_t ui32Head = g_ui32ADCHead;
-            uint32_t ui32Space = USBBufferSpaceAvailable(&g_sTxBuffer);
+            uint32_t ui32Space;
 
             //
             // Status first, then exactly ONE batch of samples.
@@ -1357,7 +1558,33 @@ main(void)
             QueueOverflowDelta();
             ServiceStatusQueue();
 
-            if((ui32Tail != ui32Head) && (ui32Space >= 3))
+            //
+            // Read the free space AFTER servicing status: those writes go
+            // into this same ring, so a figure taken before them is stale by
+            // up to a full status queue.
+            //
+            ui32Space = TxRingFree();
+
+            //
+            // Samples waiting in the ADC ring.
+            //
+            uint32_t ui32Avail = (ui32Head - ui32Tail) & ADC_BUFFER_MASK;
+
+            //
+            // Encode a whole batch when a whole batch is there.  The loop runs
+            // far faster than the ADC produces, so without this it would wake
+            // up to ~70 samples every pass and pay the full per-call cost to
+            // move a hundred bytes -- measured at 58% of the CPU.
+            //
+            // The trickle case keeps a slow sample rate alive: if the
+            // transmit ring is down to less than a packet, send whatever is
+            // available rather than waiting for a batch that may be a long
+            // time coming.
+            //
+            if((ui32Space >= 3) &&
+               (((ui32Avail >= (USB_BATCH_BYTES / 3 * 2)) &&
+                 (ui32Space >= USB_BATCH_BYTES)) ||
+                ((TxRingUsed() < USB_PACKET_BYTES) && (ui32Avail >= 2))))
             {
                 // Round the limit down to a whole number of triplets
                 uint32_t ui32Limit = (ui32Space < USB_BATCH_BYTES)
@@ -1387,7 +1614,7 @@ main(void)
 
                 if(ui32Bytes)
                 {
-                    USBBufferWrite(&g_sTxBuffer, g_pui8USBBatch, ui32Bytes);
+                    TxRingWrite(g_pui8USBBatch, ui32Bytes);
                     g_ui32ADCTail = ui32Tail;
                 }
             }
@@ -1400,6 +1627,20 @@ main(void)
             g_ui32ADCTail = g_ui32ADCHead;
             g_ui32OverflowReported = g_ui32ADCOverflow;
             g_ui8StatusTail = g_ui8StatusHead;   // discard stale status
+        }
+
+        //
+        // Keep the packet chain running.  usblib's buffer layer used to
+        // restart transmission for us; without it, nothing else will once the
+        // class goes idle with bytes still queued.  Masking the USB interrupt
+        // here is the only place the transmit path takes a lock at all -- once
+        // per main-loop pass, against once per byte before.
+        //
+        if(g_bUSBConfigured)
+        {
+            MAP_IntDisable(INT_USB0);
+            TxPumpPacket();
+            MAP_IntEnable(INT_USB0);
         }
 
         //

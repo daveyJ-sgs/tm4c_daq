@@ -81,10 +81,11 @@ SAMPLE_RATE_PRESETS = [
 ]
 DEFAULT_SAMPLE_RATE_INDEX = 1   # Default to the current reliable operating point
 
-# Measured sustained throughput of the USB CDC link on this host: ~358 kB/s at
+# Measured sustained throughput of the USB CDC link on this host: ~516 kB/s at
 # 1.5 bytes/sample.  Rates above this acquire correctly but cannot be streamed
 # continuously -- the firmware ring overflows and reports the drops.
-LINK_LIMIT_SPS = 240_000
+# 333 kS/s now streams with zero loss; 400 kS/s does not.
+LINK_LIMIT_SPS = 340_000
 
 # Triplet realignment.  Only the b0 slot is constrained (never 0xFF), so an
 # elevated 0xFF rate there means the stream has slipped.  Command triplets do

@@ -96,8 +96,8 @@ tUSBDCDCDevice g_sCDCDevice =
     (void *)&g_sCDCDevice,
     USBBufferEventCallback,
     (void *)&g_sRxBuffer,
-    USBBufferEventCallback,
-    (void *)&g_sTxBuffer,
+    TxHandler,
+    (void *)0,
     g_ppui8StringDescriptors,
     NUM_STRING_DESCRIPTORS
 };
@@ -119,17 +119,7 @@ tUSBBuffer g_sRxBuffer =
 };
 
 //*****************************************************************************
-// USB TX buffer (device -> host, ADC streaming)
+// There is deliberately no TX tUSBBuffer.  main.c owns the transmit ring and
+// feeds the CDC class whole packets; see the transmit path comment there for
+// why usblib's buffer layer is not used on this side.
 //*****************************************************************************
-uint8_t g_pui8USBTxBuffer[USB_TX_BUFFER_SIZE];
-tUSBBuffer g_sTxBuffer =
-{
-    true,                           // Transmit buffer
-    TxHandler,                      // pfnCallback
-    (void *)&g_sCDCDevice,          // Callback data
-    USBDCDCPacketWrite,             // pfnTransfer
-    USBDCDCTxPacketAvailable,       // pfnAvailable
-    (void *)&g_sCDCDevice,          // pvHandle
-    g_pui8USBTxBuffer,              // pui8Buffer
-    USB_TX_BUFFER_SIZE,             // ui32BufferSize
-};
