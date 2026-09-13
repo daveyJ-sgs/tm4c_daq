@@ -137,6 +137,12 @@ the next one.
 
 ## Measured performance and limits
 
+- **The GUI is clean only to 250 kS/s**, which is not the same number. Over
+  15 s windows the full application loses 5,700-30,800 S/s at 333 kS/s with
+  repeated resyncs, because decoding competes with the plot for the GIL; 200 k
+  and 250 k measure completely clean. The bare SerialReader does 333,240 S/s
+  with zero drops, so this is the GUI, not the link. LINK_LIMIT_SPS reflects
+  the GUI figure so the UI does not promise what it cannot deliver.
 - **333 kS/s is the safe continuous operating point**: 501.5 kB/s measured at
   the byte level = 334,365 S/s delivered, zero reported drops. 200 kS/s
   measures 300.1 kB/s = 200,040 S/s, also zero loss.

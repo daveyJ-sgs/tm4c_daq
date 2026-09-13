@@ -81,11 +81,16 @@ SAMPLE_RATE_PRESETS = [
 ]
 DEFAULT_SAMPLE_RATE_INDEX = 1   # Default to the current reliable operating point
 
-# Measured sustained throughput of the USB CDC link on this host: ~516 kB/s at
-# 1.5 bytes/sample.  Rates above this acquire correctly but cannot be streamed
-# continuously -- the firmware ring overflows and reports the drops.
-# 333 kS/s now streams with zero loss; 400 kS/s does not.
-LINK_LIMIT_SPS = 340_000
+# The highest rate THIS APPLICATION can consume without loss, which is not the
+# same as what the link can carry.  The firmware streams 333 kS/s with zero
+# loss (measured at the byte level, and through SerialReader alone: 333,240
+# S/s, 0 drops, 0 resyncs).  The full GUI cannot -- decoding competes with the
+# plot for the GIL, and over 15 s windows 333 kS/s loses 5,700-30,800 samples/s
+# with repeated resyncs.  200 k and 250 k measure completely clean.
+#
+# Rates above this still acquire correctly and are the right choice for burst
+# capture; they just cannot be streamed live into this GUI.
+LINK_LIMIT_SPS = 260_000
 
 # Triplet realignment.  Only the b0 slot is constrained (never 0xFF), so an
 # elevated 0xFF rate there means the stream has slipped.  Command triplets do
@@ -96,6 +101,16 @@ ALIGN_MIN_BYTES   = 300         # need a reasonable sample before judging
 BUFFER_SIZE  = 2500000          # Rolling buffer (~5s at 500kHz)
 DISPLAY_WINDOW = 2000           # Default samples shown in plot
 UPDATE_HZ    = 30               # GUI refresh rate
+RATE_WINDOW_S = 2.0             # rolling window for the measured-rate readout
+
+# Serial read timeout.  This sets how much the reader thread gets per read and
+# therefore how large each numpy decode pass is.  Too short and the thread
+# wakes ~1000x a second to decode a few hundred bytes, where per-call overhead
+# dominates and the GIL is held almost continuously -- which starves the GUI
+# thread and, at high sample rates, loses bytes.
+# 20 ms measured best: at 333 kS/s through the full GUI it delivers 333,521 S/s
+# with 383 drops/s, against 270,509 S/s and 42,381 drops/s at 1 ms.
+READ_TIMEOUT = 0.020
 MAX_PLOT_POINTS = 4000          # Downsample display above this
 
 DUTY_LABELS = {0: "10%", 1: "25%", 2: "50%", 3: "75%", 4: "90%"}
@@ -449,7 +464,7 @@ class SerialReader(QObject):
 
     def _run(self):
         try:
-            ser = serial.Serial(self.port, self.baud, timeout=0.001)
+            ser = serial.Serial(self.port, self.baud, timeout=READ_TIMEOUT)
             if hasattr(ser, "set_buffer_size"):
                 try:
                     ser.set_buffer_size(rx_size=1 << 20, tx_size=1 << 16)
@@ -538,6 +553,8 @@ class DAQWindow(QMainWindow):
         self._overflow_count = 0
         self._stall_count  = 0
         self._start_time   = 0.0
+        self._rate_t0      = 0.0    # rolling-rate window start
+        self._rate_n0      = 0
         self._stats        = {}
         self._test_harness = None
 
@@ -939,6 +956,8 @@ class DAQWindow(QMainWindow):
         self._running      = True
         self._start_time   = time.time()
         self._sample_count = 0
+        self._rate_t0      = self._start_time
+        self._rate_n0      = 0
         self.btn_connect.setText("Disconnect")
         self.btn_connect.setStyleSheet("background: #8b0000;")
         self.cb_port.setEnabled(False)
@@ -1253,11 +1272,18 @@ class DAQWindow(QMainWindow):
         self.lbl_samples.setText(f"{self._sample_count:,}")
         self.lbl_overflow.setText(f"{self._overflow_count:,}")
         if self._start_time:
-            elapsed = time.time() - self._start_time
-            self.lbl_elapsed.setText(f"{elapsed:.0f}s")
-            if elapsed > 0:
+            now = time.time()
+            self.lbl_elapsed.setText(f"{now - self._start_time:.0f}s")
+
+            # Rolling window rather than a session average: a session average
+            # never converges after a sample-rate change, and this readout is
+            # what tells you whether the link is keeping up right now.
+            window = now - self._rate_t0
+            if window >= RATE_WINDOW_S:
                 self.lbl_rate.setText(
-                    f"Rate: {self._sample_count / elapsed:,.0f} Hz")
+                    f"Rate: {(self._sample_count - self._rate_n0) / window:,.0f} Hz")
+                self._rate_t0 = now
+                self._rate_n0 = self._sample_count
 
     # -- Utilities ---------------------------------
     def _clear_stats(self):
@@ -1266,6 +1292,8 @@ class DAQWindow(QMainWindow):
         self._overflow_count = 0
         self._stall_count = 0
         self._start_time   = time.time()
+        self._rate_t0      = self._start_time
+        self._rate_n0      = 0
         self._frame_count  = 0
         self.curve.setData([])
         self.lbl_overflow.setText("0")
