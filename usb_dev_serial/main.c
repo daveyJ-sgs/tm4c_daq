@@ -1449,7 +1449,16 @@ main(void)
         //
         // PC commands: burst / trigger action
         //
-        if(g_bCmdBurst)
+        //
+        // A burst action taken mid-frame would abandon the payload partway
+        // through.  The host counts the payload out by length and has no
+        // resynchronisation point inside it, so it would swallow whatever
+        // came next -- including the very state message announcing the
+        // change -- and only recover once it had eaten a frame's worth of
+        // unrelated bytes.  Hold the action until the frame is out; the
+        // worst case is one frame of latency, ~34 ms at 8192 samples.
+        //
+        if(g_bCmdBurst && (g_eBurstState != BURST_DRAINING))
         {
             uint8_t ui8Action = g_ui8BurstAction;
             g_bCmdBurst = false;

@@ -175,6 +175,12 @@ the next one.
   every caller while the state is DRAINING. One stray status triplet after
   BEGIN would shift every following sample by a byte, and the protocol has no
   way to signal it. The header is queued while still in FULL, before the lock.
+- **Burst actions are deferred while DRAINING.** Arming or disarming mid-frame
+  would abandon the payload partway through, and the host counts the payload
+  out by length with no resynchronisation point inside it -- so it swallows
+  whatever comes next, including the state message announcing the change, and
+  only recovers after eating a frame's worth of unrelated bytes. The action is
+  held until the frame is out; worst case one frame of latency, ~34 ms at 8192.
 - **The ADC keeps converting during IDLE/FULL/DRAINING** and throws the samples
   away. Stopping it would freeze `g_ui32SampleCount`, trip the acquisition
   watchdog, and have it rebuild the pipeline in the middle of a transfer.
