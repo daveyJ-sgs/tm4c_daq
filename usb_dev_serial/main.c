@@ -32,6 +32,7 @@
 //   [0xFF] [0x40 | duty_index] [0x00]   PWM duty changed
 //   [0xFF] [0x60 | rate_index] [0x00]   ADC sample rate changed
 //   [0xFF] [0x80 | oflow[11:8]] [oflow[7:0]]  ADC overflow delta report
+//   [0xFF] [0xA0 | recoveries[3:0]] [0x00]     Acquisition stall recovered
 //
 //*****************************************************************************
 
@@ -73,6 +74,11 @@
 // ADC circular buffer (power of 2, sized for 500kHz DMA streaming)
 #define ADC_BUFFER_SIZE         8192
 #define ADC_BUFFER_MASK         (ADC_BUFFER_SIZE - 1)
+
+// Acquisition watchdog: SysTick ticks of no new samples before we assume the
+// uDMA ping-pong has stalled and rebuild it.  At the slowest preset (100 kS/s)
+// a buffer completes every 2.6 ms, so 10 ticks (100 ms) cannot false-trip.
+#define WATCHDOG_TICKS          10
 
 //*****************************************************************************
 // PWM frequency presets — logarithmic spread from 100 Hz to 500 kHz
@@ -133,6 +139,12 @@ static volatile uint32_t g_ui32ADCTail = 0;
 static volatile uint32_t g_ui32ADCOverflow = 0;
 static volatile uint32_t g_ui32SampleCount = 0;
 static volatile uint32_t g_ui32OverflowReported = 0;
+
+// Acquisition watchdog state (g_ui32WatchdogLast/Ticks are SysTick-private)
+static volatile bool     g_bPipelineStalled = false;
+static volatile uint32_t g_ui32StallRecoveries = 0;
+static uint32_t          g_ui32WatchdogLast = 0;
+static uint8_t           g_ui8WatchdogTicks = 0;
 
 // System state
 static volatile uint32_t g_ui32SysTickCount = 0;
@@ -409,6 +421,26 @@ SysTickIntHandler(void)
     DebounceButton(BTN_DUTY, (ui32PortF & GPIO_PIN_0) ? 1 : 0);
 
     //
+    // Acquisition watchdog.  If both ping-pong halves are ever left in
+    // UDMA_MODE_STOP -- an ISR delayed past a full buffer, or a debugger halt --
+    // nothing re-arms them and sampling stops silently with USB still up.
+    // Detect here; repair from the main loop where the ADC ISR can be masked.
+    //
+    if(g_ui32SampleCount == g_ui32WatchdogLast)
+    {
+        if(++g_ui8WatchdogTicks >= WATCHDOG_TICKS)
+        {
+            g_ui8WatchdogTicks = 0;
+            g_bPipelineStalled = true;
+        }
+    }
+    else
+    {
+        g_ui32WatchdogLast = g_ui32SampleCount;
+        g_ui8WatchdogTicks = 0;
+    }
+
+    //
     // Heartbeat: toggle red LED every 500ms
     //
     if((g_ui32SysTickCount % 50) == 0)
@@ -451,7 +483,7 @@ ProcessDMABuffer(uint32_t *pui32Buf, uint32_t ui32Count)
 void
 ADC0Seq3Handler(void)
 {
-    MAP_ADCIntClear(ADC0_BASE, 3);
+    MAP_ADCIntClearEx(ADC0_BASE, ADC_INT_DMA_SS3);
 
     //
     // Check primary buffer (A) — UDMA_MODE_STOP means transfer complete
@@ -565,28 +597,37 @@ ConfigureADC(void)
     //
     ADCSequenceDMAEnable(ADC0_BASE, 3);
 
-    MAP_ADCIntEnable(ADC0_BASE, 3);
+    //
+    // Interrupt on DMA completion rather than sequence completion.  With uDMA
+    // driving SS3 the sequence interrupt is the wrong source: clearing it does
+    // not acknowledge the DMA-done condition, so the two can drift apart.
+    //
+    MAP_ADCIntClearEx(ADC0_BASE, ADC_INT_DMA_SS3 | ADC_INT_SS3);
+    MAP_ADCIntEnableEx(ADC0_BASE, ADC_INT_DMA_SS3);
     MAP_IntEnable(INT_ADC0SS3);
 }
 
+//*****************************************************************************
+// (Re)program both uDMA ping-pong halves and restart the channel.
+//
+// Used both for first-time setup and by the watchdog to recover a stalled
+// pipeline.  Safe to call with the channel already running provided the ADC
+// interrupt is masked by the caller.
+//*****************************************************************************
 static void
-ConfigureDMA(void)
+ADCPipelineRearm(void)
 {
-    MAP_SysCtlPeripheralEnable(SYSCTL_PERIPH_UDMA);
-    while(!MAP_SysCtlPeripheralReady(SYSCTL_PERIPH_UDMA)) {}
-
-    MAP_uDMAEnable();
-    MAP_uDMAControlBaseSet(g_pui8DMAControlTable);
-
     //
-    // Channel 17 = ADC0 SS3 (default assignment on TM4C123G).
-    // Clear all attributes, then enable high priority.
+    // Stop the channel and drain anything left in the SS3 FIFO, so the first
+    // DMA transfer after the restart is a fresh conversion rather than a stale
+    // one captured while the pipeline was wedged.
     //
-    MAP_uDMAChannelAttributeDisable(UDMA_CHANNEL_ADC3,
-        UDMA_ATTR_ALTSELECT | UDMA_ATTR_USEBURST |
-        UDMA_ATTR_HIGH_PRIORITY | UDMA_ATTR_REQMASK);
-    MAP_uDMAChannelAttributeEnable(UDMA_CHANNEL_ADC3,
-        UDMA_ATTR_HIGH_PRIORITY);
+    MAP_uDMAChannelDisable(UDMA_CHANNEL_ADC3);
+
+    while(!(HWREG(ADC0_BASE + ADC_O_SSFSTAT3) & ADC_SSFSTAT3_EMPTY))
+    {
+        (void)HWREG(ADC0_BASE + ADC_O_SSFIFO3);
+    }
 
     //
     // Primary control: ADC0 SS3 FIFO -> Buffer A
@@ -610,9 +651,35 @@ ConfigureDMA(void)
         g_pui32DMABufB, DMA_BUFFER_SIZE);
 
     //
-    // Enable the channel — DMA will start on first ADC trigger
+    // Enable the channel — DMA will start on the next ADC trigger
     //
+    MAP_ADCIntClearEx(ADC0_BASE, ADC_INT_DMA_SS3);
     MAP_uDMAChannelEnable(UDMA_CHANNEL_ADC3);
+}
+
+static void
+ConfigureDMA(void)
+{
+    MAP_SysCtlPeripheralEnable(SYSCTL_PERIPH_UDMA);
+    while(!MAP_SysCtlPeripheralReady(SYSCTL_PERIPH_UDMA)) {}
+
+    MAP_uDMAEnable();
+    MAP_uDMAControlBaseSet(g_pui8DMAControlTable);
+
+    //
+    // Channel 17 = ADC0 SS3 (default assignment on TM4C123G).
+    // Clear all attributes, then enable high priority.
+    //
+    MAP_uDMAChannelAttributeDisable(UDMA_CHANNEL_ADC3,
+        UDMA_ATTR_ALTSELECT | UDMA_ATTR_USEBURST |
+        UDMA_ATTR_HIGH_PRIORITY | UDMA_ATTR_REQMASK);
+    MAP_uDMAChannelAttributeEnable(UDMA_CHANNEL_ADC3,
+        UDMA_ATTR_HIGH_PRIORITY);
+
+    //
+    // Program both ping-pong halves and start the channel
+    //
+    ADCPipelineRearm();
 }
 
 static void
@@ -739,6 +806,21 @@ main(void)
     //
     while(1)
     {
+        //
+        // Watchdog tripped: the ping-pong stalled and sampling has stopped.
+        // Rebuild it with the ADC interrupt masked so the ISR cannot observe a
+        // half-programmed channel.
+        //
+        if(g_bPipelineStalled)
+        {
+            g_bPipelineStalled = false;
+            MAP_IntDisable(INT_ADC0SS3);
+            ADCPipelineRearm();
+            MAP_IntEnable(INT_ADC0SS3);
+            g_ui32StallRecoveries++;
+            SendUSBCommand(0xA0 | (uint8_t)(g_ui32StallRecoveries & 0x0F));
+        }
+
         //
         // Batch-drain ADC ring buffer into USB for max throughput.
         // Encode pairs of samples as 3-byte triplets (1.5 bytes/sample),
