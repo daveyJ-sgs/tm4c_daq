@@ -181,11 +181,23 @@ static volatile uint8_t g_ui8CmdSampleRateIndex = 0;
 // Must be a multiple of 3 (3 bytes per 2-sample triplet)
 #define USB_BATCH_BYTES     768
 
-// Bytes reserved at the top of the USB TX buffer exclusively for command packets.
-// The data encoding loop stops early to keep this space free, guaranteeing
-// SendUSBCommand always finds room even when the pipeline is fully loaded.
-#define USB_CMD_RESERVE     24  // 8 command triplets
 static uint8_t g_pui8USBBatch[USB_BATCH_BYTES];
+
+// Pending status triplets (command echoes, overflow reports, stall recoveries).
+//
+// Status must never be dropped: a vanished overflow report hides data loss, and
+// a lost command echo leaves the GUI's indicators disagreeing with the firmware.
+// Reserving space at the top of the TX buffer did not work -- under sustained
+// saturation the stream still consumed it and status went out at zero packets
+// per second.  Queue status instead and hand it the buffer BEFORE bulk data, so
+// it is retried until it fits rather than discarded.  The cost is negligible:
+// at 400 kS/s the overflow rate needs ~39 triplets/s, ~120 B/s out of ~358 kB/s.
+#define STATUS_QUEUE_SIZE   16      // power of 2
+#define STATUS_QUEUE_MASK   (STATUS_QUEUE_SIZE - 1)
+static volatile uint8_t g_pui8StatusQueue[STATUS_QUEUE_SIZE][2];
+static volatile uint8_t g_ui8StatusHead = 0;
+static volatile uint8_t g_ui8StatusTail = 0;
+
 
 // uDMA control table — must be 1024-byte aligned in SRAM
 static uint8_t g_pui8DMAControlTable[1024] __attribute__((aligned(1024)));
@@ -730,41 +742,81 @@ ConfigureUSB(void)
 }
 
 //*****************************************************************************
-// Send a 3-byte command triplet over USB (space guaranteed by USB_CMD_RESERVE)
+// Queue one status triplet [0xFF][ui8B1][ui8B2] for transmission
+//*****************************************************************************
+static bool
+QueueStatus(uint8_t ui8B1, uint8_t ui8B2)
+{
+    uint8_t ui8Next = (g_ui8StatusHead + 1) & STATUS_QUEUE_MASK;
+
+    if(ui8Next == g_ui8StatusTail)
+    {
+        return(false);              // queue full; caller retries later
+    }
+
+    g_pui8StatusQueue[g_ui8StatusHead][0] = ui8B1;
+    g_pui8StatusQueue[g_ui8StatusHead][1] = ui8B2;
+    g_ui8StatusHead = ui8Next;
+
+    return(true);
+}
+
+//*****************************************************************************
+// Queue a command echo
 //*****************************************************************************
 static void
 SendUSBCommand(uint8_t ui8Cmd)
 {
-    if(g_bUSBConfigured && USBBufferSpaceAvailable(&g_sTxBuffer) >= 3)
+    QueueStatus(ui8Cmd, 0x00);
+}
+
+//*****************************************************************************
+// Turn the outstanding overflow delta into queued 12-bit status triplets
+//*****************************************************************************
+static void
+QueueOverflowDelta(void)
+{
+    while(g_ui32ADCOverflow != g_ui32OverflowReported)
     {
-        uint8_t pui8Pkt[3] = {0xFF, ui8Cmd, 0x00};
-        USBBufferWrite(&g_sTxBuffer, pui8Pkt, 3);
+        uint32_t ui32Delta = g_ui32ADCOverflow - g_ui32OverflowReported;
+        uint16_t ui16Chunk = (ui32Delta > 0x0FFF) ? 0x0FFF : (uint16_t)ui32Delta;
+
+        if(!QueueStatus((uint8_t)(0x80 | ((ui16Chunk >> 8) & 0x0F)),
+                        (uint8_t)(ui16Chunk & 0xFF)))
+        {
+            break;                  // queue full; the rest reports next pass
+        }
+
+        g_ui32OverflowReported += ui16Chunk;
     }
 }
 
 //*****************************************************************************
-// Report a firmware overflow delta using one or more 12-bit status triplets
+// Push queued status triplets into the USB TX buffer, oldest first
 //*****************************************************************************
-static uint32_t
-SendUSBOverflowDelta(uint32_t ui32Delta)
+static void
+ServiceStatusQueue(void)
 {
-    uint32_t ui32Sent = 0;
-
-    while(ui32Delta && g_bUSBConfigured &&
-          USBBufferSpaceAvailable(&g_sTxBuffer) >= 3)
+    while(g_ui8StatusTail != g_ui8StatusHead)
     {
-        uint16_t ui16Chunk = (ui32Delta > 0x0FFF) ? 0x0FFF : (uint16_t)ui32Delta;
-        uint8_t pui8Pkt[3] = {
-            0xFF,
-            (uint8_t)(0x80 | ((ui16Chunk >> 8) & 0x0F)),
-            (uint8_t)(ui16Chunk & 0xFF)
-        };
-        USBBufferWrite(&g_sTxBuffer, pui8Pkt, 3);
-        ui32Delta -= ui16Chunk;
-        ui32Sent += ui16Chunk;
-    }
+        uint8_t pui8Pkt[3];
 
-    return(ui32Sent);
+        //
+        // Only write a whole triplet.  A partial write would shift every later
+        // sample by a byte and the protocol has no way to resynchronise.
+        //
+        if(USBBufferSpaceAvailable(&g_sTxBuffer) < 3)
+        {
+            return;
+        }
+
+        pui8Pkt[0] = 0xFF;
+        pui8Pkt[1] = g_pui8StatusQueue[g_ui8StatusTail][0];
+        pui8Pkt[2] = g_pui8StatusQueue[g_ui8StatusTail][1];
+
+        USBBufferWrite(&g_sTxBuffer, pui8Pkt, 3);
+        g_ui8StatusTail = (g_ui8StatusTail + 1) & STATUS_QUEUE_MASK;
+    }
 }
 
 //*****************************************************************************
@@ -829,22 +881,35 @@ main(void)
         if(g_bUSBConfigured)
         {
             uint32_t ui32Tail = g_ui32ADCTail;
-            uint32_t ui32Head;
+            uint32_t ui32Head = g_ui32ADCHead;
+            uint32_t ui32Space = USBBufferSpaceAvailable(&g_sTxBuffer);
 
-            while(ui32Tail != (ui32Head = g_ui32ADCHead))
+            //
+            // Status first, then exactly ONE batch of samples.
+            //
+            // The drain loop must stay bounded.  Under saturation the ADC ring
+            // never empties, and USBBufferWrite hands bytes straight to the
+            // endpoint so TX space never runs out either -- so a loop that
+            // exits only on "ring empty" or "buffer full" never exits at all.
+            // It spins here writing data and never returns to the top of the
+            // main loop, which is why status previously went out at exactly
+            // zero packets per second no matter how much space was reserved
+            // for it.  One batch per pass keeps status serviced; at 768 bytes
+            // a pass the loop still outruns the USB link by orders of
+            // magnitude.
+            //
+            QueueOverflowDelta();
+            ServiceStatusQueue();
+
+            if((ui32Tail != ui32Head) && (ui32Space >= 3))
             {
-                uint32_t ui32Space = USBBufferSpaceAvailable(&g_sTxBuffer);
-                if(ui32Space <= USB_CMD_RESERVE + 2)
-                    break;
-
-                // Round limit down to a triplet boundary, keeping CMD_RESERVE free
-                uint32_t ui32DataSpace = ui32Space - USB_CMD_RESERVE;
-                uint32_t ui32Limit = (ui32DataSpace < USB_BATCH_BYTES)
-                                     ? (ui32DataSpace / 3 * 3)
+                // Round the limit down to a whole number of triplets
+                uint32_t ui32Limit = (ui32Space < USB_BATCH_BYTES)
+                                     ? (ui32Space / 3 * 3)
                                      : USB_BATCH_BYTES;
                 uint32_t ui32Bytes = 0;
 
-                // Encode pairs of ADC samples: 2 × 12-bit → 3 bytes
+                // Encode pairs of ADC samples: 2 x 12-bit -> 3 bytes
                 while((ui32Bytes + 3 <= ui32Limit) &&
                       (ui32Tail != ui32Head) &&
                       (((ui32Tail + 1) & ADC_BUFFER_MASK) != ui32Head))
@@ -864,18 +929,11 @@ main(void)
                     g_pui8USBBatch[ui32Bytes++] = (uint8_t)(sB);
                 }
 
-                if(ui32Bytes == 0)
-                    break;
-
-                USBBufferWrite(&g_sTxBuffer, g_pui8USBBatch, ui32Bytes);
-                g_ui32ADCTail = ui32Tail;
-            }
-
-            if(g_ui32ADCOverflow != g_ui32OverflowReported)
-            {
-                uint32_t ui32PendingOverflow =
-                    g_ui32ADCOverflow - g_ui32OverflowReported;
-                g_ui32OverflowReported += SendUSBOverflowDelta(ui32PendingOverflow);
+                if(ui32Bytes)
+                {
+                    USBBufferWrite(&g_sTxBuffer, g_pui8USBBatch, ui32Bytes);
+                    g_ui32ADCTail = ui32Tail;
+                }
             }
         }
         else
@@ -885,6 +943,7 @@ main(void)
             //
             g_ui32ADCTail = g_ui32ADCHead;
             g_ui32OverflowReported = g_ui32ADCOverflow;
+            g_ui8StatusTail = g_ui8StatusHead;   // discard stale status
         }
 
         //
