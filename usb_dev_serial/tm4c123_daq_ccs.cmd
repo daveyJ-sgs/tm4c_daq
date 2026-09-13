@@ -45,4 +45,9 @@ SECTIONS
 #endif
 }
 
-__STACK_TOP = __stack + 1024;
+/* Must match the linker --stack_size option (see .cproject STACK_SIZE).
+   2 KB, not 1 KB: the stack grows down into .bss, so an overflow silently
+   corrupts the USB batch buffer and usblib state.  Depth comes from three
+   levels of interrupt nesting (ADC 0x00 / USB 0x40 / SysTick 0x80) plus FPU
+   lazy stacking, and there is spare SRAM to cover it. */
+__STACK_TOP = __stack + 2048;

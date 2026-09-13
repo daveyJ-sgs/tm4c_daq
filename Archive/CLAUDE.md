@@ -1,3 +1,7 @@
+> **Superseded.** See the CLAUDE.md at the repository root for current build,
+> protocol and pin information. This file is a March 2026 snapshot describing an
+> older 2-byte protocol and PWM preset set, kept for history only.
+
 # TM4C123G DAQ — USB CDC Streaming
 
 ## Project Overview

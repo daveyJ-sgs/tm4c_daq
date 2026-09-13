@@ -19,6 +19,12 @@ Command packets (3 bytes, triplet-aligned):
     [0xFF] [0x40 | duty_index] [0x00]   PWM duty changed (SW2)
     [0xFF] [0x60 | rate_index] [0x00]   ADC sample-rate changed
     [0xFF] [0x80 | oflow_hi]   [oflow_lo]  Firmware overflow delta
+    [0xFF] [0xA0 | recoveries]  [0x00]      Acquisition stall recovered
+
+Note: the stream carries no sync marker, so a lost or duplicated byte would
+misalign every triplet after it and decode as garbage forever.  Data triplets
+can never begin with 0xFF, and the reader uses that invariant to detect the
+condition and re-derive the offset.
 """
 
 import sys
@@ -53,6 +59,18 @@ SAMPLE_RATE_PRESETS = [
     (400_000, "400 kS/s"),
 ]
 DEFAULT_SAMPLE_RATE_INDEX = 1   # Default to the current reliable operating point
+
+# Measured sustained throughput of the USB CDC link on this host: ~358 kB/s at
+# 1.5 bytes/sample.  Rates above this acquire correctly but cannot be streamed
+# continuously -- the firmware ring overflows and reports the drops.
+LINK_LIMIT_SPS = 240_000
+
+# Triplet realignment.  Only the b0 slot is constrained (never 0xFF), so an
+# elevated 0xFF rate there means the stream has slipped.  Command triplets do
+# legitimately put 0xFF in b0 but stay well under 1% even during heavy overflow
+# reporting, while a slipped stream measures 10-90%.
+ALIGN_TOLERANCE   = 0.05
+ALIGN_MIN_BYTES   = 300         # need a reasonable sample before judging
 BUFFER_SIZE  = 2500000          # Rolling buffer (~5s at 500kHz)
 DISPLAY_WINDOW = 2000           # Default samples shown in plot
 UPDATE_HZ    = 30               # GUI refresh rate
@@ -134,6 +152,8 @@ class SerialReader(QObject):
     freq_changed   = Signal(int)    # Frequency index 0-4
     sample_rate_changed = Signal(int)  # Sample-rate preset index
     overflow_delta = Signal(int)    # Number of samples dropped in firmware
+    stall_recovered = Signal(int)   # Firmware recovered a stalled DMA pipeline
+    resynced       = Signal(int)    # Reader re-derived triplet alignment
     status_changed = Signal(str)    # Status string for UI
 
     def __init__(self, port, baud=115200):
@@ -146,6 +166,7 @@ class SerialReader(QObject):
         self._write_queue = queue.SimpleQueue()  # GUI thread → reader thread writes
         self._samples_lock = threading.Lock()
         self._sample_chunks = collections.deque()
+        self._resync_count = 0
 
     def start(self):
         self._stop.clear()
@@ -211,6 +232,20 @@ class SerialReader(QObject):
                     continue
 
                 buf = np.frombuffer(leftover + raw, dtype=np.uint8)
+
+                # Triplet alignment guard.  The protocol has no sync marker, so
+                # a single lost or duplicated byte would garble every sample
+                # from here on with nothing to signal it.  Data triplets never
+                # start with 0xFF; if the b0 slot says otherwise, re-derive the
+                # offset from the slot that does satisfy the invariant.
+                if len(buf) >= ALIGN_MIN_BYTES:
+                    rates = [float((buf[o::3] == 0xFF).mean()) for o in range(3)]
+                    best = min(range(3), key=lambda o: rates[o])
+                    if best != 0 and rates[0] > ALIGN_TOLERANCE                             and rates[best] < rates[0] / 4:
+                        buf = buf[best:]
+                        self._resync_count += 1
+                        self.resynced.emit(self._resync_count)
+
                 n_triplets = len(buf) // 3
                 leftover = bytes(buf[n_triplets * 3:])  # save 0-2 bytes
 
@@ -241,6 +276,8 @@ class SerialReader(QObject):
                         elif code == 0x80:
                             delta = (arg << 8) | int(cmd_b2)
                             self.overflow_delta.emit(delta)
+                        elif code == 0xA0:
+                            self.stall_recovered.emit(arg)
 
                 # Data triplets — fully vectorized, no Python loop
                 if is_data.any():
@@ -277,6 +314,7 @@ class DAQWindow(QMainWindow):
         self._sample_rate_index = DEFAULT_SAMPLE_RATE_INDEX
         self._sample_count = 0
         self._overflow_count = 0
+        self._stall_count  = 0
         self._start_time   = 0.0
         self._stats        = {}
         self._test_harness = None
@@ -325,8 +363,19 @@ class DAQWindow(QMainWindow):
 
         top.addWidget(QLabel("  ADC Rate:"))
         self.cb_sample_rate = QComboBox()
-        for idx, (_, label) in enumerate(SAMPLE_RATE_PRESETS):
-            self.cb_sample_rate.addItem(label, idx)
+        for idx, (rate, label) in enumerate(SAMPLE_RATE_PRESETS):
+            if rate > LINK_LIMIT_SPS:
+                # Acquires fine; the USB link cannot carry it continuously.
+                self.cb_sample_rate.addItem(f"{label}  (exceeds link)", idx)
+                self.cb_sample_rate.setItemData(
+                    idx,
+                    f"{label}: the ADC keeps up, but the USB CDC link tops out "
+                    f"near {LINK_LIMIT_SPS:,} S/s. The firmware drops the excess "
+                    f"and reports it in the Overflows counter. Use for burst "
+                    f"capture, not continuous streaming.",
+                    Qt.ToolTipRole)
+            else:
+                self.cb_sample_rate.addItem(label, idx)
         self.cb_sample_rate.setCurrentIndex(DEFAULT_SAMPLE_RATE_INDEX)
         self.cb_sample_rate.currentIndexChanged.connect(
             self._on_sample_rate_selection_changed
@@ -466,10 +515,16 @@ class DAQWindow(QMainWindow):
         i_layout.addWidget(QLabel("Overflows:"), 2, 0)
         self.lbl_overflow = QLabel("0")
         i_layout.addWidget(self.lbl_overflow, 2, 1)
+        i_layout.addWidget(QLabel("DMA recoveries:"), 3, 0)
+        self.lbl_stalls = QLabel("0")
+        i_layout.addWidget(self.lbl_stalls, 3, 1)
+        i_layout.addWidget(QLabel("Resyncs:"), 4, 0)
+        self.lbl_resyncs = QLabel("0")
+        i_layout.addWidget(self.lbl_resyncs, 4, 1)
 
         btn_clear = QPushButton("Clear Statistics")
         btn_clear.clicked.connect(self._clear_stats)
-        i_layout.addWidget(btn_clear, 3, 0, 1, 2)
+        i_layout.addWidget(btn_clear, 5, 0, 1, 2)
 
         self.btn_test = QPushButton("Run Test Suite")
         self.btn_test.setStyleSheet("background: #1a5c2a; font-weight: bold;")
@@ -548,6 +603,8 @@ class DAQWindow(QMainWindow):
         self._reader.freq_changed.connect(self._on_freq_changed)
         self._reader.sample_rate_changed.connect(self._on_sample_rate_changed)
         self._reader.overflow_delta.connect(self._on_overflow_delta)
+        self._reader.stall_recovered.connect(self._on_stall_recovered)
+        self._reader.resynced.connect(self._on_resynced)
         self._reader.status_changed.connect(self._on_status)
         self._reader.start()
 
@@ -611,6 +668,20 @@ class DAQWindow(QMainWindow):
         self.lbl_overflow.setText(f"{self._overflow_count:,}")
         self.statusBar().showMessage(
             f"Firmware overflow reported: +{delta} samples", 3000)
+
+    def _on_stall_recovered(self, count):
+        # Firmware watchdog rebuilt a stalled uDMA ping-pong.  Rare; a steadily
+        # climbing count means the acquisition path is being starved.
+        self._stall_count += 1
+        self.lbl_stalls.setText(f"{self._stall_count:,}")
+        self.statusBar().showMessage(
+            "Firmware recovered a stalled acquisition pipeline", 4000)
+
+    def _on_resynced(self, count):
+        # Reader re-derived triplet alignment after a byte slip.
+        self.lbl_resyncs.setText(f"{count:,}")
+        self.statusBar().showMessage(
+            "Stream misaligned — triplet alignment recovered", 4000)
 
     def _on_status(self, msg):
         self.lbl_status.setText(msg)
@@ -693,9 +764,11 @@ class DAQWindow(QMainWindow):
         self._ring.clear()
         self._sample_count = 0
         self._overflow_count = 0
+        self._stall_count = 0
         self._start_time   = time.time()
         self.curve.setData([])
         self.lbl_overflow.setText("0")
+        self.lbl_stalls.setText("0")
         if self._reader:
             self._reader.drain_samples()
 
