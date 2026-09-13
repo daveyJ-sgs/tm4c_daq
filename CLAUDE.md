@@ -3,7 +3,7 @@
 12-bit data acquisition on an EK-TM4C123GXL, streaming over USB Full-Speed CDC
 to a PySide6 GUI.
 
-> Authoritative as of 2026-09-12. `Archive/CLAUDE.md` and `Archive/save/*.md` are
+> Authoritative as of 2026-09-12 (burst capture + trigger landed). `Archive/CLAUDE.md` and `Archive/save/*.md` are
 > earlier snapshots kept for history and describe a protocol and pin set that no
 > longer exist — do not build from them.
 
@@ -46,8 +46,10 @@ Two build warnings are expected and harmless: the `wchar_t` mismatch between
 tiarmclang and the pre-built TivaWare libs, and the `tiobj2bin` post-build
 failure (it only affects `.bin`; the `.out` flashes fine).
 
-Current footprint: ~17.5 KB of 256 KB flash, 31,611 of 32,768 B SRAM
+Current footprint: ~19.6 KB of 256 KB flash, 31,673 of 32,768 B SRAM
 (**~1.1 KB free** — the ADC ring is 16 KB and the USB TX buffer 8 KB).
+There is no room for a second capture buffer, which is why burst mode reuses
+the streaming ring and the two modes are mutually exclusive.
 
 ## Source layout
 
@@ -80,13 +82,51 @@ Clamp the whole sample, never just its high byte — clamping the byte folds
 | `0x60` | ADC sample-rate index changed |
 | `0x80` | overflow delta — 12-bit count of samples dropped |
 | `0xA0` | acquisition stall recovered (count in low nibble) |
+| `0xC0` | burst/trigger, sub-coded in the low nibble — see below |
 
-**Host → device**: `[0xFE][code|index]`, same codes.
+**Host → device**: `[0xFE][code|index]` for the presets above, and a four-byte
+form with a 16-bit big-endian argument for burst: `[0xFE][0xC0|sub][hi][lo]`.
+
+The code byte is matched against `0xE0`, **not** `0x60`. The old mask ignored
+bit 7, which aliases `0xC0` onto `0x40` — a trigger setting would have been
+read as a duty-cycle change.
 
 There is **no sync marker**. A single lost byte misaligns every following
 triplet permanently. Data triplets can never start with `0xFF`, and the GUI
 reader uses that invariant to detect a slip and re-derive the offset
 (`ALIGN_TOLERANCE` in `tm4c_daq.py`).
+
+## Burst capture and trigger
+
+Streaming and burst are **mutually exclusive** — both use `g_pui16ADCBuffer`.
+While burst is engaged the ADC ISR stops filling the ring and the streaming
+drain is skipped entirely (measured: zero stray samples).
+
+States, reported as `[0xFF][0xC0][state]`:
+`0` stream · `1` idle · `2` armed · `3` triggered · `4` full · `5` draining.
+
+Host commands, `[0xFE][0xC0|sub][hi][lo]`:
+
+| sub | name | argument |
+|---|---|---|
+| `0x0` | ACTION | 0 disarm · 1 arm single · 2 arm continuous · 3 force trigger |
+| `0x1` | LEVEL | trigger level, 0–4095 |
+| `0x2` | SLOPE | 0 rising, 1 falling |
+| `0x3` | PRE_PCT | pre-trigger window as a percent of capture length, 0–95 |
+| `0x4` | LENGTH | capture length in samples, 64–8192, forced even |
+| `0x5` | AUTO_MS | auto-trigger timeout in ms (scope "Auto"); 0 waits forever |
+
+A capture is delivered as `STATE=full`, then header triplets `0xC1`/`0xC2`
+(length), `0xC3`/`0xC4` (trigger offset), `0xC5` (rate index), `0xC6` (flags:
+bit0 slope, bit1 trigger was forced), `0xC8`/`0xC9` (the level that actually
+fired), then `0xC7` BEGIN, then exactly `length/2` ordinary data triplets with
+nothing interleaved, then `STATE=idle` or `STATE=armed`.
+
+**BEGIN is always the last header triplet** — do not assume ascending subcodes.
+
+At 8192 samples the frame is 12,288 bytes, ~34 ms on the wire. Config subcodes
+are snapshotted when the device arms, so a setting sent mid-capture applies to
+the next one.
 
 ## Presets
 
@@ -102,6 +142,12 @@ reader uses that invariant to detect a slip and re-derive the offset
 - The **USB CDC link is**: ~358 kB/s ≈ 239 kS/s. Anything above that is dropped
   at the ring and reported via the `0x80` telemetry. Accounting balances to
   within 0.1 % (e.g. at 400 kS/s: 242,235 delivered + 157,564 reported drops).
+- **Burst capture is not subject to any of this.** All five presets return a
+  complete 8192-sample frame with the trigger at exactly the requested offset,
+  acquired rate measured from the data itself against the known PWM period:
+  100 k, 200 k, 250 k and 400 k all land at +0.00 %, and 333 k at 333,320 S/s
+  (-0.004 %).  The 333 k and 400 k presets cannot be streamed at all.
+
 - That ~358 kB/s is only **25–30 % of the USB Full-Speed bulk ceiling**
   (~1.216 MB/s). The limit is usblib: both `usbdcdc` and `usbdbulk` allow only
   one 64-byte packet in flight. Double-packet buffering was tried, verified set
@@ -125,13 +171,36 @@ reader uses that invariant to detect a slip and re-derive the offset
   and starves everything below it. One batch per pass.
 - Once the firmware is pushed past the link ceiling it stops echoing commands
   until the load drops; commands still apply.
+- **Nothing may be interleaved into a burst frame.** `QueueStatus` refuses
+  every caller while the state is DRAINING. One stray status triplet after
+  BEGIN would shift every following sample by a byte, and the protocol has no
+  way to signal it. The header is queued while still in FULL, before the lock.
+- **Burst actions are deferred while DRAINING.** Arming or disarming mid-frame
+  would abandon the payload partway through, and the host counts the payload
+  out by length with no resynchronisation point inside it -- so it swallows
+  whatever comes next, including the state message announcing the change, and
+  only recovers after eating a frame's worth of unrelated bytes. The action is
+  held until the frame is out; worst case one frame of latency, ~34 ms at 8192.
+- **The ADC keeps converting during IDLE/FULL/DRAINING** and throws the samples
+  away. Stopping it would freeze `g_ui32SampleCount`, trip the acquisition
+  watchdog, and have it rebuild the pipeline in the middle of a transfer.
+- **`sA` is clamped to 4079, `sB` is not** — only `b0` has to avoid `0xFF`. A
+  rail-to-rail square wave therefore shows a 16-count sawtooth on alternate
+  samples at the top rail. This is correct; do not "fix" it.
+- Do not call `reset_input_buffer()` on the host. It cuts mid-triplet and there
+  is no sync marker, so everything after it decodes as garbage. Discard whole
+  reads and re-derive the offset from the `b0` invariant instead.
 
 ## Roadmap
 
 1. ~~uDMA ping-pong for the ADC~~ — done
-2. **Burst capture** — fill SRAM at full ADC speed, then transfer. The real
-   unlock given the USB ceiling.
-3. **Trigger system** — edge trigger, pre-trigger buffer, auto/normal/single.
-   Shares a state machine with burst capture; build them together.
-4. Scope GUI — timebase, cursors, FFT, measurements
-5. Multi-channel, analog frontend
+2. ~~Burst capture~~ — done
+3. ~~Trigger system~~ — done (edge, pre-trigger, auto/normal/single)
+4. **Burst sample rates above 400 kS/s.** Burst no longer has to respect the
+   link ceiling, so the preset table is the only thing holding the rate down.
+   The TM4C123 ADC is specified to 1 Msps and 400,687 S/s is simply the highest
+   preset we have, not a measured limit. Add presets and verify the achieved
+   rate the same way — deliberately as its own step, not folded into another
+   change.
+5. Scope GUI — timebase, cursors, FFT, measurements
+6. Multi-channel, analog frontend

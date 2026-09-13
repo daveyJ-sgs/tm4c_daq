@@ -33,6 +33,30 @@
 //   [0xFF] [0x60 | rate_index] [0x00]   ADC sample rate changed
 //   [0xFF] [0x80 | oflow[11:8]] [oflow[7:0]]  ADC overflow delta report
 //   [0xFF] [0xA0 | recoveries[3:0]] [0x00]     Acquisition stall recovered
+//   [0xFF] [0xC0 | sub] [data]                 Burst/trigger, see below
+//
+// Burst capture and trigger
+// -------------------------
+// Streaming and burst are mutually exclusive: both use g_pui16ADCBuffer, and
+// with ~1.1 KB of SRAM free there is no room for a second capture buffer.
+//
+// Device -> host burst subcodes (0xC0 | sub):
+//   0x0 STATE    0=stream 1=idle 2=armed 3=triggered 4=full 5=draining
+//   0x1 LEN_HI   0x2 LEN_LO      capture length in samples
+//   0x3 TRIG_HI  0x4 TRIG_LO     trigger offset within the frame
+//   0x5 RATE     sample-rate preset index used for the capture
+//   0x6 FLAGS    bit0 slope (0=rising), bit1 trigger was forced/auto
+//   0x8 LVL_HI   0x9 LVL_LO      trigger level this capture actually used
+//   0x7 BEGIN    frame payload starts at the very next triplet
+//
+// Host -> device, four bytes with a 16-bit big-endian argument:
+//   [0xFE] [0xC0 | sub] [argHi] [argLo]
+//   0x0 ACTION   0=disarm 1=arm single 2=arm continuous 3=force trigger
+//   0x1 LEVEL    trigger level 0-4095
+//   0x2 SLOPE    0=rising 1=falling
+//   0x3 PRE_PCT  pre-trigger window as a percent of capture length
+//   0x4 LENGTH   capture length in samples (64-8192, forced even)
+//   0x5 AUTO_MS  auto-trigger timeout in ms, 0 = wait indefinitely
 //
 //*****************************************************************************
 
@@ -79,6 +103,11 @@
 // uDMA ping-pong has stalled and rebuild it.  At the slowest preset (100 kS/s)
 // a buffer completes every 2.6 ms, so 10 ticks (100 ms) cannot false-trip.
 #define WATCHDOG_TICKS          10
+
+// Burst capture limits.  The shortest capture is bounded so a frame is always
+// worth drawing, and the longest is the whole shared buffer.
+#define BURST_MIN_SAMPLES       64
+#define BURST_MAX_SAMPLES       ADC_BUFFER_SIZE
 
 //*****************************************************************************
 // PWM frequency presets — logarithmic spread from 100 Hz to 500 kHz
@@ -145,6 +174,67 @@ static volatile bool     g_bPipelineStalled = false;
 static volatile uint32_t g_ui32StallRecoveries = 0;
 static uint32_t          g_ui32WatchdogLast = 0;
 static uint8_t           g_ui8WatchdogTicks = 0;
+
+//
+// Burst capture / trigger state.
+//
+// g_pui16ADCBuffer is shared with streaming, so only one of the two can be
+// live at a time.  In burst mode the same memory is a rolling pre-trigger
+// window: samples are written circularly while ARMED, and on the trigger edge
+// we remember where the record starts and count down the post-trigger
+// samples.  The record is therefore always contiguous modulo ADC_BUFFER_MASK
+// and the trigger always lands at offset g_ui32ActivePre.
+//
+typedef enum
+{
+    BURST_OFF = 0,          // streaming; burst subsystem idle
+    BURST_IDLE,             // burst engaged, not armed; samples discarded
+    BURST_ARMED,            // filling the pre-trigger window, hunting the edge
+    BURST_TRIGGERED,        // edge found, filling the post-trigger window
+    BURST_FULL,             // capture complete, buffer frozen
+    BURST_DRAINING          // sending the frame to the host
+}
+tBurstState;
+
+static volatile tBurstState g_eBurstState    = BURST_OFF;
+static tBurstState          g_eReportedState = BURST_OFF;
+
+// Configuration.  Written by the RX ISR at any time; snapshotted on arm, so a
+// setting sent mid-capture takes effect on the next one rather than corrupting
+// the record in flight.
+static volatile uint16_t g_ui16TrigLevel  = 2048;
+static volatile uint16_t g_ui16CaptureLen = BURST_MAX_SAMPLES;
+static volatile uint16_t g_ui16AutoMs     = 0;
+static volatile uint8_t  g_ui8PrePercent  = 50;
+static volatile bool     g_bTrigFalling   = false;
+
+// Live capture state (ISR-owned once armed).  Level and slope are copied here
+// at arm time rather than read live: the ISR compares every sample against
+// them, so a host that retunes the level mid-capture would otherwise change
+// the threshold underneath a record already in progress, and the frame header
+// would describe a trigger that never happened.
+static volatile uint16_t g_ui16ActiveLevel  = 0;
+static volatile bool     g_bActiveFalling   = false;
+static volatile bool     g_bBurstContinuous = false;
+static volatile bool     g_bForceTrigger    = false;
+static volatile bool     g_bTrigWasForced   = false;
+static volatile uint32_t g_ui32ActiveLen    = 0;
+static volatile uint32_t g_ui32ActivePre    = 0;
+static volatile uint32_t g_ui32BurstWrite   = 0;
+static volatile uint32_t g_ui32BurstFill    = 0;
+static volatile uint32_t g_ui32BurstStart   = 0;
+static volatile uint32_t g_ui32PostRemain   = 0;
+static volatile uint16_t g_ui16PrevSample   = 0;
+static volatile uint32_t g_ui32ArmTick      = 0;
+static volatile uint32_t g_ui32CaptureCount = 0;
+
+// Drain cursor (main-loop private)
+static uint32_t          g_ui32DrainPos  = 0;
+static uint32_t          g_ui32DrainLeft = 0;
+
+// Burst command staging (RX ISR -> main loop)
+static volatile bool     g_bCmdBurst      = false;
+static volatile uint8_t  g_ui8BurstAction = 0;
 
 // System state
 static volatile uint32_t g_ui32SysTickCount = 0;
@@ -322,6 +412,52 @@ TxHandler(void *pvCBData, uint32_t ui32Event, uint32_t ui32MsgValue,
     return(0);
 }
 
+//*****************************************************************************
+// Apply a burst/trigger configuration word from the host (RX ISR context)
+//
+// Only ACTION needs main-loop work -- the rest are plain stores that the arm
+// path snapshots, so they are safe to take at any point in a capture.
+//*****************************************************************************
+static void
+BurstCommand(uint8_t ui8Sub, uint16_t ui16Arg)
+{
+    switch(ui8Sub)
+    {
+        case 0x0:                           // ACTION
+            g_ui8BurstAction = (uint8_t)ui16Arg;
+            g_bCmdBurst = true;
+            break;
+
+        case 0x1:                           // LEVEL
+            g_ui16TrigLevel = (ui16Arg > 4095) ? 4095 : ui16Arg;
+            break;
+
+        case 0x2:                           // SLOPE
+            g_bTrigFalling = (ui16Arg != 0);
+            break;
+
+        case 0x3:                           // PRE_PCT
+            g_ui8PrePercent = (ui16Arg > 95) ? 95 : (uint8_t)ui16Arg;
+            break;
+
+        case 0x4:                           // LENGTH
+        {
+            uint16_t ui16Len = ui16Arg;
+            if(ui16Len > BURST_MAX_SAMPLES) { ui16Len = BURST_MAX_SAMPLES; }
+            if(ui16Len < BURST_MIN_SAMPLES) { ui16Len = BURST_MIN_SAMPLES; }
+            g_ui16CaptureLen = (uint16_t)(ui16Len & 0xFFFE);
+            break;
+        }
+
+        case 0x5:                           // AUTO_MS
+            g_ui16AutoMs = ui16Arg;
+            break;
+
+        default:
+            break;
+    }
+}
+
 uint32_t
 RxHandler(void *pvCBData, uint32_t ui32Event, uint32_t ui32MsgValue,
           void *pvMsgData)
@@ -332,47 +468,71 @@ RxHandler(void *pvCBData, uint32_t ui32Event, uint32_t ui32MsgValue,
         {
             uint8_t ui8Char;
             static uint8_t ui8RxState = 0;
+            static uint8_t ui8RxCode  = 0;
+            static uint8_t ui8RxArgHi = 0;
 
             while(USBBufferRead((tUSBBuffer *)&g_sRxBuffer, &ui8Char, 1))
             {
                 //
-                // Two-byte command: [0xFE] [0x20|freq_idx] or [0xFE] [0x40|duty_idx]
+                // [0xFE] [code|index]                two-byte preset commands
+                // [0xFE] [0xC0|sub] [argHi] [argLo]  four-byte burst commands
+                //
+                // The code byte is masked with 0xE0, not 0x60: the burst codes
+                // set bit 7 and the old mask would have aliased 0xC0 onto
+                // 0x40, turning a trigger setting into a duty-cycle change.
                 //
                 if(ui8RxState == 0)
                 {
                     if(ui8Char == 0xFE)
                         ui8RxState = 1;
                 }
+                else if(ui8RxState == 1)
+                {
+                    if((ui8Char & 0xE0) == 0xC0)
+                    {
+                        ui8RxCode  = ui8Char;
+                        ui8RxState = 2;
+                    }
+                    else
+                    {
+                        uint8_t idx = ui8Char & 0x0F;
+                        ui8RxState = 0;
+                        if((ui8Char & 0xE0) == 0x20)
+                        {
+                            if(idx < NUM_FREQ_PRESETS)
+                            {
+                                g_ui8CmdFreqIndex = idx;
+                                g_bCmdFreq = true;
+                            }
+                        }
+                        else if((ui8Char & 0xE0) == 0x40)
+                        {
+                            if(idx < NUM_DUTY_PRESETS)
+                            {
+                                g_ui8CmdDutyIndex = idx;
+                                g_bCmdDuty = true;
+                            }
+                        }
+                        else if((ui8Char & 0xE0) == 0x60)
+                        {
+                            if(idx < NUM_SAMPLE_RATE_PRESETS)
+                            {
+                                g_ui8CmdSampleRateIndex = idx;
+                                g_bCmdSampleRate = true;
+                            }
+                        }
+                    }
+                }
+                else if(ui8RxState == 2)
+                {
+                    ui8RxArgHi = ui8Char;
+                    ui8RxState = 3;
+                }
                 else
                 {
                     ui8RxState = 0;
-                    if((ui8Char & 0x60) == 0x20)
-                    {
-                        uint8_t idx = ui8Char & 0x0F;
-                        if(idx < NUM_FREQ_PRESETS)
-                        {
-                            g_ui8CmdFreqIndex = idx;
-                            g_bCmdFreq = true;
-                        }
-                    }
-                    else if((ui8Char & 0x60) == 0x40)
-                    {
-                        uint8_t idx = ui8Char & 0x0F;
-                        if(idx < NUM_DUTY_PRESETS)
-                        {
-                            g_ui8CmdDutyIndex = idx;
-                            g_bCmdDuty = true;
-                        }
-                    }
-                    else if((ui8Char & 0x60) == 0x60)
-                    {
-                        uint8_t idx = ui8Char & 0x0F;
-                        if(idx < NUM_SAMPLE_RATE_PRESETS)
-                        {
-                            g_ui8CmdSampleRateIndex = idx;
-                            g_bCmdSampleRate = true;
-                        }
-                    }
+                    BurstCommand(ui8RxCode & 0x0F,
+                                 ((uint16_t)ui8RxArgHi << 8) | ui8Char);
                 }
             }
             break;
@@ -453,6 +613,22 @@ SysTickIntHandler(void)
     }
 
     //
+    // Auto-trigger timeout.  Scope "Auto" mode: if no edge turns up within
+    // g_ui16AutoMs the capture proceeds anyway so the display keeps updating.
+    // The ISR only honours the force once the pre-trigger window is full, so a
+    // timeout shorter than the pre-fill simply fires as soon as it can.
+    //
+    if((g_eBurstState == BURST_ARMED) && (g_ui16AutoMs != 0))
+    {
+        uint32_t ui32Elapsed = (g_ui32SysTickCount - g_ui32ArmTick) *
+                               (1000 / SYSTICKS_PER_SECOND);
+        if(ui32Elapsed >= g_ui16AutoMs)
+        {
+            g_bForceTrigger = true;
+        }
+    }
+
+    //
     // Heartbeat: toggle red LED every 500ms
     //
     if((g_ui32SysTickCount % 50) == 0)
@@ -466,9 +642,87 @@ SysTickIntHandler(void)
 // Process a completed DMA buffer into the ADC ring buffer
 //*****************************************************************************
 static void
+BurstProcessBuffer(uint32_t *pui32Buf, uint32_t ui32Count)
+{
+    uint32_t i;
+
+    for(i = 0; i < ui32Count; i++)
+    {
+        uint16_t ui16S = (uint16_t)(pui32Buf[i] & 0xFFF);
+
+        switch(g_eBurstState)
+        {
+            case BURST_ARMED:
+                g_pui16ADCBuffer[g_ui32BurstWrite] = ui16S;
+                g_ui32BurstWrite = (g_ui32BurstWrite + 1) & ADC_BUFFER_MASK;
+
+                if(g_ui32BurstFill < g_ui32ActivePre)
+                {
+                    //
+                    // Still filling the pre-trigger window.  Do not look for
+                    // the edge yet: triggering now would hand back a record
+                    // with less history than the host asked for.
+                    //
+                    g_ui32BurstFill++;
+                }
+                else
+                {
+                    bool bEdge = g_bActiveFalling
+                        ? ((g_ui16PrevSample >= g_ui16ActiveLevel) &&
+                           (ui16S < g_ui16ActiveLevel))
+                        : ((g_ui16PrevSample < g_ui16ActiveLevel) &&
+                           (ui16S >= g_ui16ActiveLevel));
+
+                    if(bEdge || g_bForceTrigger)
+                    {
+                        uint32_t ui32TrigSlot =
+                            (g_ui32BurstWrite - 1) & ADC_BUFFER_MASK;
+
+                        g_bTrigWasForced = (!bEdge);
+                        g_bForceTrigger  = false;
+                        g_ui32BurstStart =
+                            (ui32TrigSlot - g_ui32ActivePre) & ADC_BUFFER_MASK;
+                        g_ui32PostRemain =
+                            g_ui32ActiveLen - g_ui32ActivePre - 1;
+                        g_eBurstState = BURST_TRIGGERED;
+                    }
+                }
+                break;
+
+            case BURST_TRIGGERED:
+                g_pui16ADCBuffer[g_ui32BurstWrite] = ui16S;
+                g_ui32BurstWrite = (g_ui32BurstWrite + 1) & ADC_BUFFER_MASK;
+                if(--g_ui32PostRemain == 0)
+                {
+                    g_ui32CaptureCount++;
+                    g_eBurstState = BURST_FULL;
+                }
+                break;
+
+            default:
+                //
+                // IDLE, FULL or DRAINING: keep converting so the acquisition
+                // watchdog still sees progress, but discard.
+                //
+                break;
+        }
+
+        g_ui16PrevSample = ui16S;
+    }
+}
+
+static void
 ProcessDMABuffer(uint32_t *pui32Buf, uint32_t ui32Count)
 {
     uint32_t i;
+
+    if(g_eBurstState != BURST_OFF)
+    {
+        BurstProcessBuffer(pui32Buf, ui32Count);
+        g_ui32SampleCount += ui32Count;
+        return;
+    }
+
     for(i = 0; i < ui32Count; i++)
     {
         uint32_t ui32Next = (g_ui32ADCHead + 1) & ADC_BUFFER_MASK;
@@ -749,6 +1003,18 @@ QueueStatus(uint8_t ui8B1, uint8_t ui8B2)
 {
     uint8_t ui8Next = (g_ui8StatusHead + 1) & STATUS_QUEUE_MASK;
 
+    //
+    // Nothing may be interleaved between the BEGIN triplet and the end of a
+    // burst frame -- the host takes the payload as one contiguous run, and a
+    // stray echo would shift every sample after it by one triplet.  The frame
+    // header is queued while the state is still BURST_FULL, so refusing every
+    // caller here is safe.
+    //
+    if(g_eBurstState == BURST_DRAINING)
+    {
+        return(false);
+    }
+
     if(ui8Next == g_ui8StatusTail)
     {
         return(false);              // queue full; caller retries later
@@ -820,6 +1086,117 @@ ServiceStatusQueue(void)
 }
 
 //*****************************************************************************
+// Free slots in the status queue
+//*****************************************************************************
+static uint8_t
+StatusQueueFree(void)
+{
+    return((uint8_t)((STATUS_QUEUE_SIZE - 1) -
+                     ((g_ui8StatusHead - g_ui8StatusTail) & STATUS_QUEUE_MASK)));
+}
+
+//*****************************************************************************
+// Arm a capture.  Snapshots the configuration so a setting that arrives
+// mid-capture cannot change the geometry of the record being taken.
+//*****************************************************************************
+static void
+BurstArm(bool bContinuous)
+{
+    uint32_t ui32Len = g_ui16CaptureLen;
+    uint32_t ui32Pre = (ui32Len * g_ui8PrePercent) / 100;
+
+    //
+    // At least one pre-trigger sample, because the edge test needs a previous
+    // sample that belongs to this capture, and at most len-2 so there is
+    // always a post-trigger sample left to count down.
+    //
+    if(ui32Pre < 1)             { ui32Pre = 1; }
+    if(ui32Pre > (ui32Len - 2)) { ui32Pre = ui32Len - 2; }
+
+    MAP_IntDisable(INT_ADC0SS3);
+
+    g_ui32ActiveLen    = ui32Len;
+    g_ui32ActivePre    = ui32Pre;
+    g_ui16ActiveLevel  = g_ui16TrigLevel;
+    g_bActiveFalling   = g_bTrigFalling;
+    g_ui32BurstWrite   = 0;
+    g_ui32BurstFill    = 0;
+    g_ui32PostRemain   = 0;
+    g_bForceTrigger    = false;
+    g_bTrigWasForced   = false;
+    g_bBurstContinuous = bContinuous;
+    g_ui32ArmTick      = g_ui32SysTickCount;
+    g_eBurstState      = BURST_ARMED;
+
+    MAP_IntEnable(INT_ADC0SS3);
+}
+
+//*****************************************************************************
+// Queue the frame header.  Must be called while still in BURST_FULL, before
+// QueueStatus starts refusing.
+//*****************************************************************************
+static void
+BurstQueueHeader(void)
+{
+    uint8_t ui8Flags = (uint8_t)((g_bActiveFalling ? 0x01 : 0x00) |
+                                 (g_bTrigWasForced ? 0x02 : 0x00));
+
+    QueueStatus(0xC1, (uint8_t)(g_ui32ActiveLen >> 8));
+    QueueStatus(0xC2, (uint8_t)(g_ui32ActiveLen & 0xFF));
+    QueueStatus(0xC3, (uint8_t)(g_ui32ActivePre >> 8));
+    QueueStatus(0xC4, (uint8_t)(g_ui32ActivePre & 0xFF));
+    QueueStatus(0xC5, g_ui8SampleRateIndex);
+    QueueStatus(0xC6, ui8Flags);
+    QueueStatus(0xC8, (uint8_t)(g_ui16ActiveLevel >> 8));
+    QueueStatus(0xC9, (uint8_t)(g_ui16ActiveLevel & 0xFF));
+    QueueStatus(0xC7, 0x00);                // BEGIN, always last
+}
+
+//*****************************************************************************
+// Push one batch of the captured frame.  Returns true when the frame is done.
+//
+// Bounded like the streaming drain, and for the same reason: USBBufferWrite
+// frees space inside the call, so a loop that only exits on "buffer full"
+// never exits at all.
+//*****************************************************************************
+static bool
+BurstDrainBatch(void)
+{
+    uint32_t ui32Space = USBBufferSpaceAvailable(&g_sTxBuffer);
+    uint32_t ui32Limit;
+    uint32_t ui32Bytes = 0;
+
+    if(ui32Space < 3)
+    {
+        return(false);
+    }
+
+    ui32Limit = (ui32Space < USB_BATCH_BYTES) ? (ui32Space / 3 * 3)
+                                              : USB_BATCH_BYTES;
+
+    while((ui32Bytes + 3 <= ui32Limit) && (g_ui32DrainLeft >= 2))
+    {
+        uint16_t sA = g_pui16ADCBuffer[g_ui32DrainPos];
+        g_ui32DrainPos = (g_ui32DrainPos + 1) & ADC_BUFFER_MASK;
+        uint16_t sB = g_pui16ADCBuffer[g_ui32DrainPos];
+        g_ui32DrainPos = (g_ui32DrainPos + 1) & ADC_BUFFER_MASK;
+        g_ui32DrainLeft -= 2;
+
+        if(sA > 4079) { sA = 4079; }
+        g_pui8USBBatch[ui32Bytes++] = (uint8_t)(sA >> 4);
+        g_pui8USBBatch[ui32Bytes++] = (uint8_t)((sA << 4) | (sB >> 8));
+        g_pui8USBBatch[ui32Bytes++] = (uint8_t)(sB);
+    }
+
+    if(ui32Bytes)
+    {
+        USBBufferWrite(&g_sTxBuffer, g_pui8USBBatch, ui32Bytes);
+    }
+
+    return(g_ui32DrainLeft == 0);
+}
+
+//*****************************************************************************
 // Main
 //*****************************************************************************
 int
@@ -874,11 +1251,90 @@ main(void)
         }
 
         //
+        // Report burst state transitions from here rather than from the ISR:
+        // the status queue is single-producer by design.  DRAINING is skipped
+        // because the host infers it from the header it has just received.
+        //
+        if(g_bUSBConfigured && (g_eBurstState != g_eReportedState) &&
+           (g_eBurstState != BURST_DRAINING))
+        {
+            if(QueueStatus(0xC0, (uint8_t)g_eBurstState))
+            {
+                g_eReportedState = g_eBurstState;
+            }
+        }
+
+        //
+        // Burst mode owns g_pui16ADCBuffer while it is engaged, so the
+        // streaming path below is skipped entirely.
+        //
+        if(g_eBurstState != BURST_OFF)
+        {
+            if(g_bUSBConfigured)
+            {
+                if(g_eBurstState == BURST_FULL)
+                {
+                    //
+                    // Hand the whole header to the queue in one go, then lock
+                    // it by entering DRAINING.  Wait for room rather than
+                    // emitting half a header.
+                    //
+                    ServiceStatusQueue();
+                    if(StatusQueueFree() >= 9)
+                    {
+                        BurstQueueHeader();
+                        g_ui32DrainPos   = g_ui32BurstStart;
+                        g_ui32DrainLeft  = g_ui32ActiveLen;
+                        g_eBurstState    = BURST_DRAINING;
+                        g_eReportedState = BURST_DRAINING;
+                    }
+                }
+                else if(g_eBurstState == BURST_DRAINING)
+                {
+                    //
+                    // Header out in full before the first payload byte.
+                    //
+                    if(g_ui8StatusTail != g_ui8StatusHead)
+                    {
+                        ServiceStatusQueue();
+                    }
+                    else if(BurstDrainBatch())
+                    {
+                        if(g_bBurstContinuous)
+                        {
+                            BurstArm(true);
+                        }
+                        else
+                        {
+                            g_eBurstState = BURST_IDLE;
+                        }
+                    }
+                }
+                else
+                {
+                    ServiceStatusQueue();
+                }
+            }
+            else
+            {
+                //
+                // Host vanished mid-frame.  Drop the partial transfer: the
+                // reader that reconnects has no way to resynchronise onto the
+                // middle of a record.
+                //
+                g_ui8StatusTail = g_ui8StatusHead;
+                if(g_eBurstState == BURST_DRAINING)
+                {
+                    g_eBurstState = BURST_IDLE;
+                }
+            }
+        }
+        //
         // Batch-drain ADC ring buffer into USB for max throughput.
         // Encode pairs of samples as 3-byte triplets (1.5 bytes/sample),
         // write up to USB_BATCH_BYTES per iteration in one call.
         //
-        if(g_bUSBConfigured)
+        else if(g_bUSBConfigured)
         {
             uint32_t ui32Tail = g_ui32ADCTail;
             uint32_t ui32Head = g_ui32ADCHead;
@@ -988,6 +1444,50 @@ main(void)
             g_ui8DutyIndex = g_ui8CmdDutyIndex;
             PWMApplySettings();
             SendUSBCommand(0x40 | g_ui8DutyIndex);
+        }
+
+        //
+        // PC commands: burst / trigger action
+        //
+        //
+        // A burst action taken mid-frame would abandon the payload partway
+        // through.  The host counts the payload out by length and has no
+        // resynchronisation point inside it, so it would swallow whatever
+        // came next -- including the very state message announcing the
+        // change -- and only recover once it had eaten a frame's worth of
+        // unrelated bytes.  Hold the action until the frame is out; the
+        // worst case is one frame of latency, ~34 ms at 8192 samples.
+        //
+        if(g_bCmdBurst && (g_eBurstState != BURST_DRAINING))
+        {
+            uint8_t ui8Action = g_ui8BurstAction;
+            g_bCmdBurst = false;
+
+            switch(ui8Action)
+            {
+                case 0:                         // disarm, resume streaming
+                    MAP_IntDisable(INT_ADC0SS3);
+                    g_eBurstState = BURST_OFF;
+                    g_ui32ADCTail = g_ui32ADCHead;
+                    MAP_IntEnable(INT_ADC0SS3);
+                    g_ui32OverflowReported = g_ui32ADCOverflow;
+                    break;
+
+                case 1:                         // arm, single shot
+                    BurstArm(false);
+                    break;
+
+                case 2:                         // arm, auto-rearm after drain
+                    BurstArm(true);
+                    break;
+
+                case 3:                         // force the trigger now
+                    g_bForceTrigger = true;
+                    break;
+
+                default:
+                    break;
+            }
         }
 
         //
