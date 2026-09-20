@@ -298,5 +298,8 @@ the next one.
    window is drawn with t=0 on it. The `Live:` combo in the Burst / Trigger
    panel selects Off / Auto / Normal (default Auto) and shares level, slope
    and pre-trigger with the burst engine. It searches back four windows, so
-   a signal that goes DC can show a stale edge for up to that long.
+   a signal that goes DC can show a stale edge for up to that long. The
+   **space bar is Run/Stop** for the live view (an application-level event
+   filter, so it works whichever control has focus); the ring and counters
+   keep moving while held, so release shows the present.
 7. Multi-channel, analog frontend

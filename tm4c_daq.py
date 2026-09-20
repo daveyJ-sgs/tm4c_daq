@@ -64,7 +64,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QGroupBox, QGridLayout, QScrollArea,
     QDoubleSpinBox,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QEvent
 from PySide6.QtGui import QFont, QColor
 
 import daq_reader
@@ -177,6 +177,8 @@ LIVE_TRIGGER_MODES = ["Off", "Auto", "Normal"]
 LIVE_TRIGGER_DEFAULT = 1                # Auto, like a scope out of the box
 LIVE_TRIGGER_HYST_COUNTS = 24           # ~19 mV: noise cannot re-arm the trigger
 LIVE_TRIGGER_SEARCH_WINDOWS = 4         # look back this many windows for an edge
+PLOT_TITLE = 'ADC Input — AIN0 (PE3)'
+PLOT_TITLE_HOLD = PLOT_TITLE + '   [ HOLD — space to run ]'
 
 
 def find_last_edge(x, level, falling, hyst, first, last):
@@ -537,6 +539,9 @@ class DAQWindow(QMainWindow):
         self._live_trigger_mode = LIVE_TRIGGER_DEFAULT
         self._live_look = False             # time axis and marker lines shown
         self._live_axis_key = None          # (window, pre_n, rate) last ranged
+        # Space bar: Run/Stop for the live view.  The ring keeps filling while
+        # held so releasing shows the present, not the past.
+        self._live_hold = False
 
         self._build_ui()
         self._build_plot()
@@ -544,6 +549,9 @@ class DAQWindow(QMainWindow):
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_plot)
         self._timer.start(1000 // UPDATE_HZ)
+
+        # Application-level so the space bar works whichever control has focus.
+        QApplication.instance().installEventFilter(self)
 
     # -- UI Layout ---------------------------------
     def _build_ui(self):
@@ -863,7 +871,7 @@ class DAQWindow(QMainWindow):
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setLabel('left',   'Voltage', units='V')
         self.plot_widget.setLabel('bottom', 'Sample',  units='')
-        self.plot_widget.setTitle('ADC Input — AIN0 (PE3)', color='#cccccc')
+        self.plot_widget.setTitle(PLOT_TITLE, color='#cccccc')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setYRange(0, VCC)
         self.plot_widget.setMouseEnabled(x=True, y=False)
@@ -1188,6 +1196,21 @@ class DAQWindow(QMainWindow):
                                     self.cb_burst_length.currentData())
 
     # -- Live display trigger ----------------------
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space
+                and not event.isAutoRepeat()):
+            self._toggle_hold()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _toggle_hold(self):
+        self._live_hold = not self._live_hold
+        self.plot_widget.setTitle(
+            PLOT_TITLE_HOLD if self._live_hold else PLOT_TITLE, color='#cccccc')
+        self.statusBar().showMessage(
+            "HOLD — press space to run" if self._live_hold else "Running",
+            0 if self._live_hold else 2000)
+
     def _on_live_trigger_changed(self, index):
         self._live_trigger_mode = index
         if index == 0 and not self._frame_mode:
@@ -1254,6 +1277,11 @@ class DAQWindow(QMainWindow):
             last_chunk = chunk
 
         self._sample_count += new_count
+
+        if self._live_hold:
+            # Frozen picture; the ring and the counters keep moving underneath.
+            self._update_session_labels()
+            return
 
         n_disp = min(self._display_window, len(self._ring))
         mode = self._live_trigger_mode
