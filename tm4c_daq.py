@@ -167,6 +167,41 @@ BURST_PRE_PERCENTS = [0, 25, 50, 75]
 BURST_SLOPES       = [("Rising", 0), ("Falling", 1)]
 BURST_DEFAULT_LEVEL_V = VCC / 2
 
+# ---- Live (display) trigger ----
+# Stabilises the streaming view the way a scope does: every refresh finds the
+# most recent level crossing in the ring and draws the window aligned to it,
+# with the pre-trigger fraction to its left.  Level, slope and pre-trigger are
+# the same controls the burst engine uses.  Host-side only; the firmware never
+# knows.  Off is the old free-running scroll.
+LIVE_TRIGGER_MODES = ["Off", "Auto", "Normal"]
+LIVE_TRIGGER_DEFAULT = 1                # Auto, like a scope out of the box
+LIVE_TRIGGER_HYST_COUNTS = 24           # ~19 mV: noise cannot re-arm the trigger
+LIVE_TRIGGER_SEARCH_WINDOWS = 4         # look back this many windows for an edge
+
+
+def find_last_edge(x, level, falling, hyst, first, last):
+    """Index of the most recent hysteretic level crossing in x[first:last], or -1.
+
+    Rising: the signal must first drop to (level - hyst) to arm, and the first
+    sample at or above level then fires.  Falling is the mirror image.  Pure
+    numpy, so even a 250 k-sample window costs a few milliseconds.
+    """
+    if last <= first + 1 or last > len(x):
+        return -1
+    seg = x[:last].astype(np.int32)
+    if falling:
+        seg = -seg
+        level = -level
+    state = np.zeros(len(seg), dtype=np.int8)
+    state[seg >= level] = 1
+    state[seg <= level - hyst] = -1
+    idx = np.where(state != 0, np.arange(len(seg)), 0)
+    np.maximum.accumulate(idx, out=idx)
+    filled = state[idx]                     # forward-filled armed/fired state
+    edges = np.flatnonzero((filled[1:] == 1) & (filled[:-1] == -1)) + 1
+    edges = edges[edges >= first]
+    return int(edges[-1]) if len(edges) else -1
+
 
 # ---------------------------------------------
 # Numpy-backed ring buffer for high-throughput
@@ -498,6 +533,11 @@ class DAQWindow(QMainWindow):
         # drawn for this engagement (then the pending spin-box value is shown).
         self._frame_level_counts = None
 
+        # Live display trigger: streaming view only, see LIVE_TRIGGER_MODES.
+        self._live_trigger_mode = LIVE_TRIGGER_DEFAULT
+        self._live_look = False             # time axis and marker lines shown
+        self._live_axis_key = None          # (window, pre_n, rate) last ranged
+
         self._build_ui()
         self._build_plot()
 
@@ -752,6 +792,20 @@ class DAQWindow(QMainWindow):
         bu_layout.addWidget(QLabel("Frames:"), 7, 0)
         self.lbl_burst_frames = QLabel("0")
         bu_layout.addWidget(self.lbl_burst_frames, 7, 1)
+
+        bu_layout.addWidget(QLabel("Live:"), 8, 0)
+        self.cb_live_trigger = QComboBox()
+        for i, label in enumerate(LIVE_TRIGGER_MODES):
+            self.cb_live_trigger.addItem(label, i)
+        self.cb_live_trigger.setCurrentIndex(LIVE_TRIGGER_DEFAULT)
+        self.cb_live_trigger.setToolTip(
+            "Display trigger for the streaming view, using the level, slope "
+            "and pre-trigger above.  Auto: align to the latest edge, free-run "
+            "if there is none.  Normal: hold the last aligned picture until "
+            "another edge arrives.  Off: free-running scroll.")
+        self.cb_live_trigger.currentIndexChanged.connect(
+            self._on_live_trigger_changed)
+        bu_layout.addWidget(self.cb_live_trigger, 8, 1)
 
         right.addWidget(grp_burst)
 
@@ -1049,6 +1103,8 @@ class DAQWindow(QMainWindow):
             return
         self._frame_mode = True
         self._frame_level_counts = None
+        self._live_look = False
+        self._live_axis_key = None
         self.plot_widget.setLabel('bottom', 'Time', units='ms')
         self.plot_widget.disableAutoRange(axis='x')
         self.trig_line.setVisible(True)
@@ -1063,6 +1119,8 @@ class DAQWindow(QMainWindow):
             return
         self._frame_mode = False
         self._frame_level_counts = None
+        self._live_look = False
+        self._live_axis_key = None
         self.plot_widget.setLabel('bottom', 'Sample', units='')
         self.plot_widget.enableAutoRange(axis='x')
         self.trig_line.setVisible(False)
@@ -1129,6 +1187,49 @@ class DAQWindow(QMainWindow):
             self._reader.send_burst(BURST_SUB_LENGTH,
                                     self.cb_burst_length.currentData())
 
+    # -- Live display trigger ----------------------
+    def _on_live_trigger_changed(self, index):
+        self._live_trigger_mode = index
+        if index == 0 and not self._frame_mode:
+            self._set_live_look(False)
+        self.statusBar().showMessage(
+            f"Live trigger: {LIVE_TRIGGER_MODES[index]}", 3000)
+
+    def _set_live_look(self, on):
+        """Time axis with t=0 on the edge, plus the trigger and level lines."""
+        self._live_look = on
+        self._live_axis_key = None
+        if on:
+            self.plot_widget.setLabel('bottom', 'Time', units='ms')
+            self.plot_widget.disableAutoRange(axis='x')
+            self.trig_line.setValue(0.0)
+            self.trig_line.setVisible(True)
+            self.level_line.setVisible(True)
+        else:
+            self.plot_widget.setLabel('bottom', 'Sample', units='')
+            self.plot_widget.enableAutoRange(axis='x')
+            self.trig_line.setVisible(False)
+            self.level_line.setVisible(False)
+
+    def _live_triggered_window(self, n):
+        """The newest n-sample window aligned to a level crossing, or (None, None).
+
+        Returns (samples, pre_n) with the edge at index pre_n.  Searches the
+        last few windows' worth of the ring so a low-frequency signal still
+        finds an edge with a short window.
+        """
+        pre_n = n * self.cb_burst_pre.currentData() // 100
+        post_n = n - pre_n
+        search = self._ring.last_n(min(len(self._ring),
+                                       LIVE_TRIGGER_SEARCH_WINDOWS * n))
+        e = find_last_edge(search, self._burst_level_counts,
+                           bool(self.cb_burst_slope.currentData()),
+                           LIVE_TRIGGER_HYST_COUNTS,
+                           pre_n, len(search) - post_n + 1)
+        if e < 0:
+            return None, None
+        return search[e - pre_n:e + post_n], pre_n
+
     # -- Plot update (GUI timer) -------------------
     def _update_plot(self):
         if not self._reader:
@@ -1154,9 +1255,32 @@ class DAQWindow(QMainWindow):
 
         self._sample_count += new_count
 
-        # Get display window as numpy array (fast slice from ring buffer)
         n_disp = min(self._display_window, len(self._ring))
-        raw = self._ring.last_n(n_disp)
+        mode = self._live_trigger_mode
+        if mode == 0:
+            if self._live_look:
+                self._set_live_look(False)
+            raw, t0 = self._ring.last_n(n_disp), None
+        else:
+            if not self._live_look:
+                self._set_live_look(True)
+            raw, t0 = self._live_triggered_window(n_disp)
+            if raw is None:
+                if mode == 2:
+                    # Normal: hold the last aligned picture until an edge
+                    # arrives; only the session counters move.
+                    self._update_session_labels()
+                    return
+                # Auto: free-run, keeping the axis where the edge would be.
+                raw = self._ring.last_n(n_disp)
+                t0 = n_disp * self.cb_burst_pre.currentData() // 100
+
+        self._draw_live(raw, t0, last_chunk)
+        self._update_session_labels()
+
+    def _draw_live(self, raw, t0, last_chunk):
+        """Draw a streaming window.  t0 is the index shown at t=0 (the trigger
+        sample) for the time axis, or None for the plain sample axis."""
         volts = raw.astype(np.float32) * (VCC / ADC_MAX)
 
         # Downsample using envelope outline: trace max forward, min backward.
@@ -1172,9 +1296,22 @@ class DAQWindow(QMainWindow):
             centers = np.arange(n_chunks, dtype=np.float32) * chunk_size + chunk_size * 0.5
             x_plot = np.concatenate([centers, centers[::-1]])
             volts_plot = np.concatenate([maxs, mins[::-1]])
-            self.curve.setData(x_plot, volts_plot)
         else:
-            self.curve.setData(volts)
+            x_plot = np.arange(len(volts), dtype=np.float32)
+            volts_plot = volts
+
+        if t0 is not None:
+            rate = SAMPLE_RATE_PRESETS[self._sample_rate_index][0]
+            ms_per = 1000.0 / rate
+            x_plot = (x_plot - t0) * ms_per
+            key = (len(raw), t0, rate)
+            if key != self._live_axis_key:
+                self._live_axis_key = key
+                self.plot_widget.setXRange(-t0 * ms_per,
+                                           (len(raw) - t0) * ms_per,
+                                           padding=0.02)
+            self.level_line.setValue(self._burst_level_counts * (VCC / ADC_MAX))
+        self.curve.setData(x_plot, volts_plot)
 
         # Stats from display window (numpy vectorized — fast)
         vmin  = volts.min()
@@ -1195,7 +1332,7 @@ class DAQWindow(QMainWindow):
         self.lbl_raw_min.setText(f"{int(raw.min())}")
         self.lbl_raw_max.setText(f"{int(raw.max())}")
 
-        # Session info
+    def _update_session_labels(self):
         self.lbl_samples.setText(f"{self._sample_count:,}")
         self.lbl_overflow.setText(f"{self._overflow_count:,}")
         if self._start_time:

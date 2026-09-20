@@ -292,5 +292,11 @@ the next one.
    preset we have, not a measured limit. Add presets and verify the achieved
    rate the same way — deliberately as its own step, not folded into another
    change.
-6. Scope GUI — timebase, cursors, FFT, measurements
+6. Scope GUI — timebase, cursors, FFT, measurements. **Live display trigger
+   done 2026-09-19**, host-side only: `find_last_edge` in `tm4c_daq.py` finds
+   the newest hysteretic level crossing in the ring each refresh and the
+   window is drawn with t=0 on it. The `Live:` combo in the Burst / Trigger
+   panel selects Off / Auto / Normal (default Auto) and shares level, slope
+   and pre-trigger with the burst engine. It searches back four windows, so
+   a signal that goes DC can show a stale edge for up to that long.
 7. Multi-channel, analog frontend
