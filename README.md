@@ -4,4 +4,7 @@ TM4C123G DAQ GUI Real-time 12-bit ADC data visualization over USB CDC for EK-TM4
 ## Research notes
 
 - [Audio anti-alias filter and DDS research — September 13, 2026](docs/research/2026-09-13-audio-aaf-and-dds.md): assembled, solder-free candidates, budget comparisons, and unresolved integration requirements. Research only; no hardware purchase finalized.
+
+## Tools
+
 - [`audio_siggen.py`](audio_siggen.py): example, not part of the DAQ. Plays looping sine, multitone, sweep and other test signals out of a laptop headphone jack (written for the ThinkPad T480), for driving PE3 through a coupling cap and 1.65 V bias. Needs `numpy` and `sounddevice`.
